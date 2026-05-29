@@ -514,15 +514,17 @@ function _factorize_general!(
             return F
         end
         # not positive definite: fall through to Bunch-Kaufman.
+        # Use the 2-arg sytrf!/hetrf! (allocates and returns ipiv) — the 3-arg
+        # preallocated-ipiv form does not exist on Julia 1.10 (the LTS).
         copyto!(C, A)
         if T <: Real
-            ipiv = _resize!(F.ipiv, n)
-            _, _, info2 = sytrf!('U', C, ipiv)
+            _, ipiv2, info2 = sytrf!('U', C)
+            F.ipiv = ipiv2
             F.info = info2
             F.form = SYMMETRIC_INDEFINITE
         else
-            ipiv = _resize!(F.ipiv, n)
-            _, _, info2 = hetrf!('U', C, ipiv)
+            _, ipiv2, info2 = hetrf!('U', C)
+            F.ipiv = ipiv2
             F.info = info2
             F.form = HERMITIAN_INDEFINITE
         end
@@ -531,8 +533,8 @@ function _factorize_general!(
         C = _ensure_fact!(F, n)
         copyto!(C, A)
         F.uplo = 'U'
-        ipiv = _resize!(F.ipiv, n)
-        _, _, info2 = sytrf!('U', C, ipiv)
+        _, ipiv2, info2 = sytrf!('U', C)
+        F.ipiv = ipiv2
         F.info = info2
         F.form = SYMMETRIC_INDEFINITE
         return F
