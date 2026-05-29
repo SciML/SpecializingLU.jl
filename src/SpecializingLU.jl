@@ -97,12 +97,28 @@ function detect_form(A::AbstractMatrix; bandwidth_cutoff::Integer = -1)
     issym = true
     isherm = true
 
-    # Single column-major pass: lower/upper bandwidth from the nonzero
-    # pattern, plus exact symmetry / Hermitian-ness from the i<j pairs.
+    # The two pieces of information have opposite access patterns, so they are
+    # gathered in two passes, each with its own cheap early-exit:
+    #
+    #  * symmetry / Hermitian-ness compares `A[i, j]` with its transpose
+    #    partner `A[j, i]` (a full row away — cache-hostile). It is computed
+    #    first, in BLK×BLK tiles so both an `A[i, j]` strip and its transpose
+    #    `A[j, i]` strip stay cache-resident; it bails the instant both flags
+    #    die (which, for an unstructured matrix, happens in the very first
+    #    tile). This is what makes the full symmetric scan cache-friendly.
+    #
+    #  * the lower/upper bandwidth is a pure column-major scan of `A[i, j]`
+    #    (unit stride) with a per-column early-exit: once a nonzero band on
+    #    both sides has ruled out triangular, the band is wider than `cutoff`
+    #    (so not banded), and symmetry has already been ruled out, only GENERAL
+    #    remains. The exact bandwidths reported on that GENERAL early-exit are
+    #    order-dependent and not part of the contract.
+    issym, isherm = _scan_symmetry(A, n)
+
+    bandexit = !issym && !isherm
     @inbounds for j in 1:n
         for i in 1:n
-            aij = A[i, j]
-            if !iszero(aij)
+            if !iszero(A[i, j])
                 d = i - j
                 if d > 0
                     d > kl && (kl = d)
@@ -110,28 +126,59 @@ function detect_form(A::AbstractMatrix; bandwidth_cutoff::Integer = -1)
                     -d > ku && (ku = -d)
                 end
             end
-            if i < j
-                aji = A[j, i]
-                issym &= (aij == aji)
-                isherm &= (aij == conj(aji))
-            elseif i == j
-                # A Hermitian matrix must have a real diagonal; a complex
-                # symmetric matrix (issym) imposes no diagonal constraint.
-                isherm &= isreal(aij)
-            end
         end
-        # Early-out for the common unstructured case: once a nonzero band on
-        # both sides rules out triangular, the band is wider than `cutoff`
-        # (so not banded), and both symmetry flags have already failed, the
-        # only remaining classification is GENERAL — no need to finish the
-        # scan. These conditions are monotonic, so this is safe.
-        if kl > 0 && ku > 0 && (kl + ku + 1) > cutoff && !issym && !isherm
+        if bandexit && kl > 0 && ku > 0 && (kl + ku + 1) > cutoff
             return DetectionResult(GENERAL, kl, ku, false, false)
         end
     end
 
     form = _classify(kl, ku, n, cutoff)
     return DetectionResult(form, kl, ku, issym, isherm)
+end
+
+# Exact symmetry / Hermitian classification, tiled for cache locality. Compares
+# `A[i, j]` with its transpose partner `A[j, i]` over the strict upper triangle
+# in BLK×BLK tiles (both an `A[i, j]` block and its `A[j, i]` partner block are
+# O(BLK²) elements and stay cache-resident), and checks the real-diagonal
+# requirement for Hermitian-ness. Bails the moment both flags are dead.
+function _scan_symmetry(A::AbstractMatrix, n::Int)
+    issym = true
+    isherm = true
+    BLK = 512
+    @inbounds for jb in 1:BLK:n
+        jhi = min(jb + BLK - 1, n)
+        for ib in 1:BLK:jb
+            ihi = min(ib + BLK - 1, jhi)
+            if ib == jb
+                # diagonal tile: strictly-upper pairs within the block, plus
+                # the real-diagonal check. Bail per column so an unstructured
+                # matrix (flags die on the first off-diagonal pair) stops almost
+                # immediately, while a symmetric matrix pays only one extra
+                # branch per column.
+                for j in jb:jhi
+                    for i in ib:(j - 1)
+                        aij = A[i, j]
+                        aji = A[j, i]
+                        issym &= (aij == aji)
+                        isherm &= (aij == conj(aji))
+                    end
+                    isherm &= isreal(A[j, j])
+                    (issym || isherm) || return (false, false)
+                end
+            else
+                for j in jb:jhi
+                    for i in ib:ihi
+                        aij = A[i, j]
+                        aji = A[j, i]
+                        issym &= (aij == aji)
+                        isherm &= (aij == conj(aji))
+                    end
+                end
+                (issym || isherm) || return (false, false)
+            end
+        end
+    end
+    return (issym, isherm)
 end
 
 function _classify(kl::Int, ku::Int, n::Int, cutoff::Int)
@@ -497,6 +544,39 @@ end
 
 # --- general / symmetric ---------------------------------------------------
 
+# Bunch-Kaufman (sytrf!/hetrf!) factoring `C` in place, storing the pivots and
+# info on `F`. On Julia ≥ 1.11 the preallocated-ipiv 3-arg form lets us reuse
+# `F.ipiv` instead of allocating a fresh `Vector{BlasInt}` per call; on the
+# 1.10 LTS only the 2-arg allocating form exists. The `@static if` is resolved
+# at compile time so both branches stay type-stable.
+@static if VERSION >= v"1.11"
+    function _bunchkaufman_into!(F::SpecializedLU{T}, C::AbstractMatrix{T}, ::Val{:sym}) where {T <: BlasFloat}
+        ipiv = _resize!(F.ipiv, F.n)
+        _, _, info = sytrf!('U', C, ipiv)
+        F.info = info
+        return F
+    end
+    function _bunchkaufman_into!(F::SpecializedLU{T}, C::AbstractMatrix{T}, ::Val{:herm}) where {T <: BlasFloat}
+        ipiv = _resize!(F.ipiv, F.n)
+        _, _, info = hetrf!('U', C, ipiv)
+        F.info = info
+        return F
+    end
+else
+    function _bunchkaufman_into!(F::SpecializedLU{T}, C::AbstractMatrix{T}, ::Val{:sym}) where {T <: BlasFloat}
+        _, ipiv, info = sytrf!('U', C)
+        F.ipiv = ipiv
+        F.info = info
+        return F
+    end
+    function _bunchkaufman_into!(F::SpecializedLU{T}, C::AbstractMatrix{T}, ::Val{:herm}) where {T <: BlasFloat}
+        _, ipiv, info = hetrf!('U', C)
+        F.ipiv = ipiv
+        F.info = info
+        return F
+    end
+end
+
 # BlasFloat: try the symmetric specializations, otherwise plain LU.
 function _factorize_general!(
         F::SpecializedLU{T}, A::AbstractMatrix{T},
@@ -514,18 +594,12 @@ function _factorize_general!(
             return F
         end
         # not positive definite: fall through to Bunch-Kaufman.
-        # Use the 2-arg sytrf!/hetrf! (allocates and returns ipiv) — the 3-arg
-        # preallocated-ipiv form does not exist on Julia 1.10 (the LTS).
         copyto!(C, A)
         if T <: Real
-            _, ipiv2, info2 = sytrf!('U', C)
-            F.ipiv = ipiv2
-            F.info = info2
+            _bunchkaufman_into!(F, C, Val(:sym))
             F.form = SYMMETRIC_INDEFINITE
         else
-            _, ipiv2, info2 = hetrf!('U', C)
-            F.ipiv = ipiv2
-            F.info = info2
+            _bunchkaufman_into!(F, C, Val(:herm))
             F.form = HERMITIAN_INDEFINITE
         end
         return F
@@ -533,9 +607,7 @@ function _factorize_general!(
         C = _ensure_fact!(F, n)
         copyto!(C, A)
         F.uplo = 'U'
-        _, ipiv2, info2 = sytrf!('U', C)
-        F.ipiv = ipiv2
-        F.info = info2
+        _bunchkaufman_into!(F, C, Val(:sym))
         F.form = SYMMETRIC_INDEFINITE
         return F
     else
@@ -563,9 +635,24 @@ function _factorize_general!(
     return F
 end
 
-# Shared dense-LU fallback. `lu!` dispatches to LAPACK getrf! for BlasFloat
-# and to the generic factorization otherwise; we keep the raw factors + pivots
-# so the workspace type stays concrete.
+# Shared dense-LU fallback. For BlasFloat on Julia ≥ 1.11 the preallocated-ipiv
+# `getrf!(C, ipiv; check)` exists, so we factor straight into the reused
+# `F.ipiv` buffer and skip the fresh `Vector{BlasInt}` that `lu!`/2-arg `getrf!`
+# would allocate every call. Older Julia (and generic element types) keep the
+# `lu!` path. We keep the raw factors + pivots so the workspace type stays
+# concrete.
+@static if VERSION >= v"1.11"
+    function _factorize_dense_lu!(F::SpecializedLU{T}, A::AbstractMatrix{T}) where {T <: BlasFloat}
+        n = F.n
+        C = _ensure_fact!(F, n)
+        copyto!(C, A)
+        ipiv = _resize!(F.ipiv, n)
+        _, _, info = getrf!(C, ipiv; check = false)
+        F.info = info
+        return F
+    end
+end
+
 function _factorize_dense_lu!(F::SpecializedLU{T}, A::AbstractMatrix{T}) where {T}
     n = F.n
     C = _ensure_fact!(F, n)
@@ -647,10 +734,33 @@ function _solve_lower_bidiagonal!(x, F::SpecializedLU{T}, b) where {T}
     n = F.n
     d = F.dvec
     dl = F.dl
-    @inbounds for col in axes(b, 2)
-        x[1, col] = b[1, col] / d[1]
-        for i in 2:n
-            x[i, col] = (b[i, col] - dl[i - 1] * x[i - 1, col]) / d[i]
+    cols = axes(b, 2)
+    # The row recurrence (x[i] depends on x[i-1]) is serial. With a single
+    # right-hand side that recurrence is the whole cost, so we keep the tight
+    # column-major inner loop. With multiple right-hand sides the *columns*
+    # are independent, so we hoist the column loop inside and mark it
+    # @simd ivdep to vectorize across right-hand sides.
+    if length(cols) == 1
+        @inbounds begin
+            col = first(cols)
+            x[1, col] = b[1, col] / d[1]
+            for i in 2:n
+                x[i, col] = (b[i, col] - dl[i - 1] * x[i - 1, col]) / d[i]
+            end
+        end
+    else
+        @inbounds begin
+            d1 = d[1]
+            @simd ivdep for col in cols
+                x[1, col] = b[1, col] / d1
+            end
+            for i in 2:n
+                di = d[i]
+                dli = dl[i - 1]
+                @simd ivdep for col in cols
+                    x[i, col] = (b[i, col] - dli * x[i - 1, col]) / di
+                end
+            end
         end
     end
     return x
@@ -660,10 +770,28 @@ function _solve_upper_bidiagonal!(x, F::SpecializedLU{T}, b) where {T}
     n = F.n
     d = F.dvec
     du = F.du
-    @inbounds for col in axes(b, 2)
-        x[n, col] = b[n, col] / d[n]
-        for i in (n - 1):-1:1
-            x[i, col] = (b[i, col] - du[i] * x[i + 1, col]) / d[i]
+    cols = axes(b, 2)
+    if length(cols) == 1
+        @inbounds begin
+            col = first(cols)
+            x[n, col] = b[n, col] / d[n]
+            for i in (n - 1):-1:1
+                x[i, col] = (b[i, col] - du[i] * x[i + 1, col]) / d[i]
+            end
+        end
+    else
+        @inbounds begin
+            dn = d[n]
+            @simd ivdep for col in cols
+                x[n, col] = b[n, col] / dn
+            end
+            for i in (n - 1):-1:1
+                di = d[i]
+                dui = du[i]
+                @simd ivdep for col in cols
+                    x[i, col] = (b[i, col] - dui * x[i + 1, col]) / di
+                end
+            end
         end
     end
     return x
