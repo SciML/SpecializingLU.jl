@@ -34,3 +34,26 @@ jobs:
           files: lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
         continue-on-error: true
+  downgrade:
+    name: Downgrade compat - Julia ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.10'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/julia-downgrade-compat@v1
+        with:
+          # Only runtime deps should gate downgrade-compat. Skip the stdlibs
+          # (version-locked to Julia) and the test-only tooling (Aqua /
+          # SafeTestsets), whose own older versions are CI-fragile and say
+          # nothing about this package's runtime compatibility.
+          skip: LinearAlgebra,Test,Aqua,SafeTestsets
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
