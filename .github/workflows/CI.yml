@@ -49,7 +49,11 @@ jobs:
           version: ${{ matrix.version }}
       - uses: julia-actions/julia-downgrade-compat@v1
         with:
-          skip: LinearAlgebra,Test
+          # Only runtime deps should gate downgrade-compat. Skip the stdlibs
+          # (version-locked to Julia) and the test-only tooling (Aqua /
+          # SafeTestsets), whose own older versions are CI-fragile and say
+          # nothing about this package's runtime compatibility.
+          skip: LinearAlgebra,Test,Aqua,SafeTestsets
       - uses: julia-actions/cache@v2
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
