@@ -370,13 +370,10 @@ the host supplies the LU. (`lu!` alone does **not** reproduce LinearSolve's
 value-level choice, which is why that choice must stay on the host side.)
 """
 function specializinglu(A::AbstractMatrix{T}; kwargs...) where {T}
-    # Factorizing in place needs a field, so integer element types must be
-    # promoted (an `Int` can't hold a fractional pivot). `LinearAlgebra.lutype`
-    # is exactly the promotion `lu`/`\` apply: `Int`→Float64 but `Rational`,
-    # `BigFloat`, `Dual`, etc. left untouched — so a rational solve stays exact
-    # rather than being silently widened to Float64. It is a compile-time
-    # constant, so this stays type-stable and copy-free for already-field inputs.
-    S = LinearAlgebra.lutype(T)
+    # Factorizing requires a field; promote integer/rational element types to
+    # their float, matching `LinearAlgebra.lu` / `\`. `float(T)` is resolved at
+    # compile time, so this stays type-stable and copy-free for float inputs.
+    S = float(T)
     F = SpecializedLU{S}()
     Af = S === T ? A : convert(AbstractMatrix{S}, A)
     return specializinglu!(F, Af; kwargs...)
@@ -576,80 +573,10 @@ function _factorize_banded!(F::SpecializedLU{T}, A::AbstractMatrix{T}) where {T 
     return F
 end
 
-# Generic element types: banded LU with partial pivoting straight into the AB
-# band buffer (same 2kl+ku+1 LAPACK layout as the BlasFloat gbtrf! path) plus
-# F.ipiv, giving O(n·(kl+ku)·kl) instead of the dense O(n³) fallback. The
-# unblocked algorithm mirrors LAPACK `gbtf2`: it agrees with gbtrf!/gbtrs!
-# bit-for-bit on BlasFloat inputs (including the pivot vector), and the AB
-# layout/ipiv convention match so `det` and `_pivsign` work unchanged.
 function _factorize_banded!(F::SpecializedLU{T}, A::AbstractMatrix{T}) where {T}
-    n = F.n
-    kl = F.kl
-    ku = F.ku
-    rows = 2kl + ku + 1
-    AB = _ensure_band!(F, rows, n)
-    fill!(AB, zero(T))
-    @inbounds for j in 1:n
-        for i in max(1, j - ku):min(n, j + kl)
-            AB[kl + ku + 1 + i - j, j] = A[i, j]
-        end
-    end
-    ipiv = _resize!(F.ipiv, n)
-    F.info = _banded_lu!(AB, kl, ku, n, ipiv)
+    _factorize_dense_lu!(F, A)
     F.form = BANDED
     return F
-end
-
-# Unblocked banded LU with partial pivoting (LAPACK gbtf2). `AB` is the packed
-# band, kv = kl+ku superdiagonals of U after fill. Row kv+1 holds the diagonal;
-# rows kv+2..kv+1+kl hold the unit-lower multipliers; rows 1..kl hold the
-# pivot-induced fill of U. `min(j+kv, n)` is the (always-safe) rightmost column
-# the step touches. Returns the index of the first zero pivot (0 if nonsingular)
-# to match the `info` contract of the BlasFloat path.
-function _banded_lu!(AB::AbstractMatrix{T}, kl::Int, ku::Int, n::Int, ipiv::Vector{Int}) where {T}
-    kv = kl + ku
-    info = 0
-    @inbounds for j in 1:n
-        km = min(kl, n - j)
-        juu = min(j + kv, n)
-        jp = 0
-        amax = abs(AB[kv + 1, j])
-        for r in 1:km
-            v = abs(AB[kv + 1 + r, j])
-            if v > amax
-                amax = v
-                jp = r
-            end
-        end
-        ipiv[j] = jp + j
-        if jp != 0
-            for jj in j:juu
-                r1 = kv + 1 + j - jj
-                r2 = r1 + jp
-                AB[r1, jj], AB[r2, jj] = AB[r2, jj], AB[r1, jj]
-            end
-        end
-        piv = AB[kv + 1, j]
-        if iszero(piv)
-            info == 0 && (info = j)
-            continue
-        end
-        if km > 0
-            inv_piv = inv(piv)
-            for r in 1:km
-                AB[kv + 1 + r, j] *= inv_piv
-            end
-            for jj in (j + 1):juu
-                u = AB[kv + 1 + j - jj, jj]
-                if !iszero(u)
-                    for r in 1:km
-                        AB[kv + 1 + (j + r) - jj, jj] -= AB[kv + 1 + r, j] * u
-                    end
-                end
-            end
-        end
-    end
-    return info
 end
 
 # --- general / symmetric ---------------------------------------------------
@@ -989,41 +916,7 @@ function _solve_banded!(x, F::SpecializedLU{T}, b) where {T <: BlasFloat}
     gbtrs!('N', F.kl, F.ku, F.n, F.band, F.ipiv, x)
     return x
 end
-
-# Generic banded solve against the factored AB band + pivots: pivot+forward L
-# sweep then a banded back-substitution against U (bandwidth kv = kl+ku). Columns
-# of a multi-rhs are independent and handled in the outer loop.
-function _solve_banded!(x, F::SpecializedLU{T}, b) where {T}
-    x === b || copyto!(x, b)
-    AB = F.band
-    ipiv = F.ipiv
-    kl = F.kl
-    ku = F.ku
-    n = F.n
-    kv = kl + ku
-    nrhs = size(x, 2)
-    @inbounds for c in 1:nrhs
-        for j in 1:n
-            ip = ipiv[j]
-            if ip != j
-                x[j, c], x[ip, c] = x[ip, c], x[j, c]
-            end
-            km = min(kl, n - j)
-            xj = x[j, c]
-            for r in 1:km
-                x[j + r, c] -= AB[kv + 1 + r, j] * xj
-            end
-        end
-        for j in n:-1:1
-            xj = x[j, c] / AB[kv + 1, j]
-            x[j, c] = xj
-            for i in max(1, j - kv):(j - 1)
-                x[i, c] -= AB[kv + 1 + i - j, j] * xj
-            end
-        end
-    end
-    return x
-end
+_solve_banded!(x, F::SpecializedLU{T}, b) where {T} = _solve_dense_lu!(x, F, b)
 
 # symmetric positive definite (Cholesky)
 function _solve_posdef!(x, F::SpecializedLU{T}, b) where {T <: BlasFloat}
@@ -1095,15 +988,17 @@ function LinearAlgebra.det(F::SpecializedLU{T}) where {T}
         end
         return T(_pivsign(F.ipiv, n) * p)
     elseif form == BANDED
-        # Both the BlasFloat (gbtrf!) and generic (`_banded_lu!`) paths write the
-        # factor into the AB band buffer with the same layout and absolute-index
-        # pivots, so U's diagonal is row kl+ku+1 and `_pivsign` applies uniformly.
-        row = F.kl + F.ku + 1
-        p = one(T)
-        @inbounds for j in 1:n
-            p *= F.band[row, j]
+        if T <: BlasFloat
+            # U's diagonal lives on row kl+ku+1 of the AB band storage.
+            row = F.kl + F.ku + 1
+            p = one(T)
+            @inbounds for j in 1:n
+                p *= F.band[row, j]
+            end
+            return T(_pivsign(F.ipiv, n) * p)
+        else
+            return det(LU(F.fact, F.ipiv, F.info))
         end
-        return T(_pivsign(F.ipiv, n) * p)
     elseif form == SYMMETRIC_POSITIVE_DEFINITE
         p = one(real(T))
         @inbounds for k in 1:n
