@@ -4,6 +4,7 @@ using LinearAlgebra
 using LinearAlgebra: BlasFloat, BlasInt
 using LinearAlgebra.LAPACK: gttrf!, gttrs!, gbtrf!, gbtrs!,
     potrf!, potrs!, sytrf!, sytrs!, hetrf!, hetrs!, getrf!, getrs!
+using PrecompileTools: @setup_workload, @compile_workload
 
 export MatrixForm,
     GENERAL, DIAGONAL, LOWER_TRIANGULAR, UPPER_TRIANGULAR,
@@ -911,6 +912,62 @@ function LinearAlgebra.det(F::SpecializedLU{T}) where {T}
         return T(det(BunchKaufman(F.fact, F.ipiv, F.uplo, false, false, F.info)))
     else
         return det(LU(F.fact, F.ipiv, F.info))
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Precompilation — exercise every form and solve path for all four BlasFloat
+# element types so the first real solve is fast (no first-call latency).
+# ---------------------------------------------------------------------------
+
+@setup_workload begin
+    @compile_workload begin
+        for T in (Float32, Float64, ComplexF32, ComplexF64)
+            n = 6
+            cv = (re, im) -> T <: Complex ? T(re, im) : T(re)
+            zT = zero(T)
+
+            Adiag = [i == j ? cv(i + 1, 0) : zT for i in 1:n, j in 1:n]
+            Altri = [i < j ? zT : (i == j ? cv(n + i, 0) : cv(1 / (i + j), 0)) for i in 1:n, j in 1:n]
+            Autri = [i > j ? zT : (i == j ? cv(n + i, 0) : cv(1 / (i + j), 0)) for i in 1:n, j in 1:n]
+            Albid = [i == j ? cv(n + i, 0) : (i == j + 1 ? cv(0.5, 0) : zT) for i in 1:n, j in 1:n]
+            Aubid = [i == j ? cv(n + i, 0) : (j == i + 1 ? cv(0.5, 0) : zT) for i in 1:n, j in 1:n]
+            Atri = [i == j ? cv(n + i, 0) : (abs(i - j) == 1 ? cv(-0.5, 0) : zT) for i in 1:n, j in 1:n]
+            Aband = [i == j ? cv(2n, 0) : (abs(i - j) <= 2 ? cv(0.25, 0) : zT) for i in 1:n, j in 1:n]
+
+            # exactly Hermitian/symmetric matrices so detection routes to
+            # potrf (SPD) / sytrf (symmetric or complex-symmetric indefinite) /
+            # hetrf (Hermitian indefinite), not the general getrf path.
+            Aspd = zeros(T, n, n)
+            Asym = zeros(T, n, n)
+            Aher = zeros(T, n, n)
+            for j in 1:n, i in 1:j
+                if i == j
+                    Aspd[i, j] = cv(2n, 0)
+                    Asym[i, j] = cv((-1)^i * n, 0)
+                    Aher[i, j] = cv((-1)^i * n, 0)
+                else
+                    v = cv(1 / (i + j), 1 / (i + 2j + 1))
+                    Aspd[i, j] = v;  Aspd[j, i] = conj(v)         # Hermitian PD
+                    w = cv(1 / (i + j + 1), 1 / (i * j + 1))
+                    Asym[i, j] = w;  Asym[j, i] = w               # (complex-)symmetric
+                    Aher[i, j] = w;  Aher[j, i] = conj(w)         # Hermitian indefinite
+                end
+            end
+            Agen = [i == j ? cv(2n, 0) : cv(1 / (i + 2j), 0) for i in 1:n, j in 1:n]
+
+            b = ones(T, n)
+            B = ones(T, n, 2)
+            for A in (Adiag, Altri, Autri, Albid, Aubid, Atri, Aband, Aspd, Asym, Aher, Agen)
+                F = specializinglu(A)
+                F \ b
+                F \ B
+                ldiv!(similar(b), F, b)
+                det(F)
+            end
+            detect_form(Agen)
+            specializinglu(Agen; fallback_lu = false)
+        end
     end
 end
 
