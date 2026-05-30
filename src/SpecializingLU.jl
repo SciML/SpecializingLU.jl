@@ -2,8 +2,8 @@ module SpecializingLU
 
 using LinearAlgebra
 using LinearAlgebra: BlasFloat, BlasInt
-using LinearAlgebra.LAPACK: gbtrf!, gbtrs!,
-    potrf!, potrs!, sytrf!, sytrs!, hetrf!, hetrs!, getrf!, getrs!
+using LinearAlgebra.LAPACK: potrf!, potrs!, sytrs!, hetrs!, chkargsok
+using LinearAlgebra.BLAS: @blasfunc, libblastrampoline
 using PrecompileTools: @setup_workload, @compile_workload
 
 export MatrixForm,
@@ -239,8 +239,11 @@ mutable struct SpecializedLU{T, R}
     dl::Vector{T}        # sub-diagonal
     du::Vector{T}        # super-diagonal
     du2::Vector{T}       # 2nd super-diagonal fill from gttrf!
-    # banded AB storage (2kl+ku+1) × n for gbtrf
+    # banded AB storage (2kl+ku+1) × n
     band::Matrix{T}
+    # reusable LAPACK work buffer for the Bunch-Kaufman query+factor; sytrf!/
+    # hetrf! otherwise allocate a fresh `work` (≈ n·nb) on every call.
+    work::Vector{T}
 end
 
 function SpecializedLU{T}() where {T}
@@ -249,7 +252,7 @@ function SpecializedLU{T}() where {T}
         GENERAL, 0, 0, 0, 'U', false, false, 0, false,
         Matrix{T}(undef, 0, 0), Int[],
         T[], T[], T[], T[],
-        Matrix{T}(undef, 0, 0)
+        Matrix{T}(undef, 0, 0), T[]
     )
 end
 
@@ -269,7 +272,7 @@ function SpecializedLU{T}(n::Integer) where {T}
         Matrix{T}(undef, nn, nn), Vector{Int}(undef, nn),
         Vector{T}(undef, nn), Vector{T}(undef, max(nn - 1, 0)),
         Vector{T}(undef, max(nn - 1, 0)), Vector{T}(undef, max(nn - 2, 0)),
-        Matrix{T}(undef, 0, 0)
+        Matrix{T}(undef, 0, 0), T[]
     )
 end
 
@@ -552,37 +555,14 @@ end
 
 # --- banded ----------------------------------------------------------------
 
-function _factorize_banded!(F::SpecializedLU{T}, A::AbstractMatrix{T}) where {T <: BlasFloat}
-    n = F.n
-    kl = F.kl
-    ku = F.ku
-    rows = 2kl + ku + 1
-    AB = _ensure_band!(F, rows, n)
-    fill!(AB, zero(T))
-    @inbounds for j in 1:n
-        for i in max(1, j - ku):min(n, j + kl)
-            AB[kl + ku + 1 + i - j, j] = A[i, j]
-        end
-    end
-    try
-        _, ipiv = gbtrf!(kl, ku, n, AB)
-        F.ipiv = ipiv
-        F.info = 0
-    catch e
-        e isa LinearAlgebra.LAPACKException || rethrow()
-        F.info = e.info
-        F.ipiv = _identity_pivots!(_resize!(F.ipiv, n))
-    end
-    F.form = BANDED
-    return F
-end
-
-# Generic element types: banded LU with partial pivoting straight into the AB
-# band buffer (same 2kl+ku+1 LAPACK layout as the BlasFloat gbtrf! path) plus
-# F.ipiv, giving O(n·(kl+ku)·kl) instead of the dense O(n³) fallback. The
-# unblocked algorithm mirrors LAPACK `gbtf2`: it agrees with gbtrf!/gbtrs!
-# bit-for-bit on BlasFloat inputs (including the pivot vector), and the AB
-# layout/ipiv convention match so `det` and `_pivsign` work unchanged.
+# Banded LU with partial pivoting straight into the AB band buffer (the
+# 2kl+ku+1 LAPACK layout) plus F.ipiv, for EVERY element type. The unblocked
+# `_banded_lu!` (LAPACK `gbtf2`) agrees with `gbtrf!`/`gbtrs!` bit-for-bit on
+# BlasFloat (including the pivot vector) and — because the narrow bands that
+# get classified `BANDED` don't benefit from LAPACK's blocking — is actually
+# ~2× faster than `gbtrf!` while reusing F.ipiv (allocation-free warm path).
+# It also gives generic (e.g. BigFloat) banded matrices O(n·(kl+ku)·kl)
+# instead of the old O(n³) dense fallback, and drops the gbtrf!/gbtrs! dep.
 function _factorize_banded!(F::SpecializedLU{T}, A::AbstractMatrix{T}) where {T}
     n = F.n
     kl = F.kl
@@ -655,38 +635,66 @@ end
 
 # --- general / symmetric ---------------------------------------------------
 
-# Bunch-Kaufman (sytrf!/hetrf!) factoring `C` in place, storing the pivots and
-# info on `F`. On Julia ≥ 1.11 the preallocated-ipiv 3-arg form lets us reuse
-# `F.ipiv` instead of allocating a fresh `Vector{BlasInt}` per call; on the
-# 1.10 LTS only the 2-arg allocating form exists. The `@static if` is resolved
-# at compile time so both branches stay type-stable.
-@static if VERSION >= v"1.11"
-    function _bunchkaufman_into!(F::SpecializedLU{T}, C::AbstractMatrix{T}, ::Val{:sym}) where {T <: BlasFloat}
-        ipiv = _resize!(F.ipiv, F.n)
-        _, _, info = sytrf!('U', C, ipiv)
-        F.info = info
-        return F
-    end
-    function _bunchkaufman_into!(F::SpecializedLU{T}, C::AbstractMatrix{T}, ::Val{:herm}) where {T <: BlasFloat}
-        ipiv = _resize!(F.ipiv, F.n)
-        _, _, info = hetrf!('U', C, ipiv)
-        F.info = info
-        return F
-    end
-else
-    function _bunchkaufman_into!(F::SpecializedLU{T}, C::AbstractMatrix{T}, ::Val{:sym}) where {T <: BlasFloat}
-        _, ipiv, info = sytrf!('U', C)
-        F.ipiv = ipiv
-        F.info = info
-        return F
-    end
-    function _bunchkaufman_into!(F::SpecializedLU{T}, C::AbstractMatrix{T}, ::Val{:herm}) where {T <: BlasFloat}
-        _, ipiv, info = hetrf!('U', C)
-        F.ipiv = ipiv
-        F.info = info
+# Bunch-Kaufman factoring `C` in place, storing the pivots and info on `F`.
+#
+# The stdlib `sytrf!`/`hetrf!` wrappers run a workspace-size query then allocate
+# a fresh `work` of length ≈ n·nb on *every* call (even the 3-arg preallocated-
+# ipiv form). To keep the warm re-factor allocation-free we call the LAPACK
+# routine directly through libblastrampoline, reusing both `F.ipiv` and a
+# persistent `F.work`: the query writes the optimal lwork into `work[1]`, we
+# grow `F.work` only if it is too small, then the real factor call reuses it.
+# We do not throw on `info > 0` (a singular Bunch-Kaufman factor); the `info`
+# stored on `F` is what `issuccess`/`det` read — matching the previous wrappers
+# (which use `chkargsok`, i.e. only error on illegal arguments).
+for (fname, kernel, elty) in (
+        (:dsytrf_, :_sytrf_into!, :Float64),
+        (:ssytrf_, :_sytrf_into!, :Float32),
+        (:csytrf_, :_sytrf_into!, :ComplexF32),
+        (:zsytrf_, :_sytrf_into!, :ComplexF64),
+        (:chetrf_, :_hetrf_into!, :ComplexF32),
+        (:zhetrf_, :_hetrf_into!, :ComplexF64),
+    )
+    @eval function $kernel(F::SpecializedLU{$elty}, C::AbstractMatrix{$elty}, uplo::AbstractChar)
+        n = F.n
+        ipiv = _resize!(F.ipiv, n)
+        if n == 0
+            F.info = 0
+            return F
+        end
+        # ensure `F.work` has room for the lwork query slot, then query.
+        work = length(F.work) >= 1 ? F.work : _resize!(F.work, 1)
+        info = Ref{BlasInt}()
+        lda = max(1, stride(C, 2))
+        ccall(
+            (@blasfunc($fname), libblastrampoline), Cvoid,
+            (
+                Ref{UInt8}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt},
+                Ptr{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}, Clong,
+            ),
+            uplo, n, C, lda, ipiv, work, BlasInt(-1), info, 1
+        )
+        chkargsok(info[])
+        lwork = BlasInt(real(work[1]))
+        length(F.work) < lwork && _resize!(F.work, Int(lwork))
+        work = F.work
+        ccall(
+            (@blasfunc($fname), libblastrampoline), Cvoid,
+            (
+                Ref{UInt8}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt},
+                Ptr{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}, Clong,
+            ),
+            uplo, n, C, lda, ipiv, work, lwork, info, 1
+        )
+        chkargsok(info[])
+        F.info = Int(info[])
         return F
     end
 end
+
+_bunchkaufman_into!(F::SpecializedLU{T}, C::AbstractMatrix{T}, ::Val{:sym}) where {T <: BlasFloat} =
+    _sytrf_into!(F, C, F.uplo)
+_bunchkaufman_into!(F::SpecializedLU{T}, C::AbstractMatrix{T}, ::Val{:herm}) where {T <: BlasFloat} =
+    _hetrf_into!(F, C, F.uplo)
 
 # BlasFloat: try the symmetric specializations, otherwise plain LU.
 function _factorize_general!(
@@ -746,22 +754,40 @@ function _factorize_general!(
     return F
 end
 
-# Shared dense-LU fallback. For BlasFloat on Julia ≥ 1.11 the preallocated-ipiv
-# `getrf!(C, ipiv; check)` exists, so we factor straight into the reused
-# `F.ipiv` buffer and skip the fresh `Vector{BlasInt}` that `lu!`/2-arg `getrf!`
-# would allocate every call. Older Julia (and generic element types) keep the
-# `lu!` path. We keep the raw factors + pivots so the workspace type stays
-# concrete.
-@static if VERSION >= v"1.11"
-    function _factorize_dense_lu!(F::SpecializedLU{T}, A::AbstractMatrix{T}) where {T <: BlasFloat}
+# LU factor of `C` (square) into the reused `F.ipiv`. The preallocated-ipiv
+# `getrf!(C, ipiv; check)` wrapper only exists on Julia ≥ 1.11, and `lu!`/the
+# 1-arg `getrf!` allocate a fresh `Vector{BlasInt}` every call — so we ccall
+# `getrf` directly (it has no work buffer, just an output pivot vector) on all
+# Julia versions to keep the warm re-factor allocation-free. `info > 0`
+# (singular U) is recorded on `F`, not thrown (chkargsok only flags illegal args).
+for (gname, elty) in (
+        (:dgetrf_, :Float64), (:sgetrf_, :Float32),
+        (:zgetrf_, :ComplexF64), (:cgetrf_, :ComplexF32),
+    )
+    @eval function _getrf_into!(F::SpecializedLU{$elty}, C::AbstractMatrix{$elty})
         n = F.n
-        C = _ensure_fact!(F, n)
-        copyto!(C, A)
         ipiv = _resize!(F.ipiv, n)
-        _, _, info = getrf!(C, ipiv; check = false)
-        F.info = info
+        n == 0 && (F.info = 0; return F)
+        info = Ref{BlasInt}()
+        lda = max(1, stride(C, 2))
+        ccall(
+            (@blasfunc($gname), libblastrampoline), Cvoid,
+            (Ref{BlasInt}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{BlasInt}, Ref{BlasInt}),
+            n, n, C, lda, ipiv, info
+        )
+        chkargsok(info[])
+        F.info = Int(info[])
         return F
     end
+end
+
+# Shared dense-LU fallback (the GENERAL form). BlasFloat goes through the
+# allocation-free `_getrf_into!` ccall; generic element types keep `lu!`. The
+# raw factors + pivots are stored so the workspace type stays concrete.
+function _factorize_dense_lu!(F::SpecializedLU{T}, A::AbstractMatrix{T}) where {T <: BlasFloat}
+    C = _ensure_fact!(F, F.n)
+    copyto!(C, A)
+    return _getrf_into!(F, C)
 end
 
 function _factorize_dense_lu!(F::SpecializedLU{T}, A::AbstractMatrix{T}) where {T}
@@ -984,16 +1010,10 @@ function _solve_tridiagonal!(x, F::SpecializedLU{T}, b) where {T}
     return x
 end
 
-# banded
-function _solve_banded!(x, F::SpecializedLU{T}, b) where {T <: BlasFloat}
-    x === b || copyto!(x, b)
-    gbtrs!('N', F.kl, F.ku, F.n, F.band, F.ipiv, x)
-    return x
-end
-
-# Generic banded solve against the factored AB band + pivots: pivot+forward L
-# sweep then a banded back-substitution against U (bandwidth kv = kl+ku). Columns
-# of a multi-rhs are independent and handled in the outer loop.
+# Banded solve against the factored AB band + pivots (every element type):
+# pivot+forward L sweep then a banded back-substitution against U (bandwidth
+# kv = kl+ku). Columns of a multi-RHS are independent and handled in the outer
+# loop. Allocation-free.
 function _solve_banded!(x, F::SpecializedLU{T}, b) where {T}
     x === b || copyto!(x, b)
     AB = F.band
@@ -1096,9 +1116,9 @@ function LinearAlgebra.det(F::SpecializedLU{T}) where {T}
         end
         return T(_pivsign(F.ipiv, n) * p)
     elseif form == BANDED
-        # Both the BlasFloat (gbtrf!) and generic (`_banded_lu!`) paths write the
-        # factor into the AB band buffer with the same layout and absolute-index
-        # pivots, so U's diagonal is row kl+ku+1 and `_pivsign` applies uniformly.
+        # `_banded_lu!` (all element types) writes the factor into the AB band
+        # buffer with U's diagonal on row kl+ku+1 and absolute-index pivots, so
+        # `_pivsign` applies uniformly.
         row = F.kl + F.ku + 1
         p = one(T)
         @inbounds for j in 1:n
