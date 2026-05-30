@@ -225,22 +225,35 @@ reltol(::Type{T}) where {T} = 1.0e-8
         end
     end
 
-    @testset "ldiv! allocations (warm workspace)" begin
+    @testset "zero allocations after setup (warm refactor + solve), all forms" begin
+        # After the initial specializinglu setup, a reuse loop must allocate
+        # NOTHING — neither the re-factorization nor the solve — for every form.
         n = 64
-        function solve_allocs(F, x, b)
-            ldiv!(x, F, b)             # warm up
-            return @allocated ldiv!(x, F, b)
+        @noinline refac_allocs(F, A) = (specializinglu!(F, A); @allocated specializinglu!(F, A))
+        @noinline solve_allocs(F, x, b) = (ldiv!(x, F, b); @allocated ldiv!(x, F, b))
+        @noinline solvem_allocs(F, X, B) = (ldiv!(X, F, B); @allocated ldiv!(X, F, B))
+        for T in (Float64, ComplexF64)
+            for form in (
+                    DIAGONAL, LOWER_BIDIAGONAL, UPPER_BIDIAGONAL, LOWER_TRIANGULAR,
+                    UPPER_TRIANGULAR, TRIDIAGONAL, BANDED, SYMMETRIC_POSITIVE_DEFINITE,
+                    SYMMETRIC_INDEFINITE, GENERAL,
+                )
+                A = make(form, T, n)
+                b = T <: Complex ? rand(T, n) : randn(T, n); x = similar(b)
+                B = T <: Complex ? rand(T, n, 4) : randn(T, n, 4); X = similar(B)
+                F = specializinglu(A)
+                @test refac_allocs(F, A) == 0       # warm re-factorization: 0 bytes
+                @test solve_allocs(F, x, b) == 0    # warm solve (vector): 0 bytes
+                @test solvem_allocs(F, X, B) == 0   # warm solve (multi-RHS): 0 bytes
+            end
         end
-        for form in (
-                DIAGONAL, LOWER_BIDIAGONAL, UPPER_BIDIAGONAL, LOWER_TRIANGULAR,
-                UPPER_TRIANGULAR, TRIDIAGONAL, BANDED, SYMMETRIC_POSITIVE_DEFINITE,
-                SYMMETRIC_INDEFINITE, GENERAL,
-            )
-            A = make(form, Float64, n)
-            b = randn(n); x = similar(b)
+        # complex Hermitian-indefinite (hetrf) too
+        let M = rand(ComplexF64, n, n), A = Matrix(M + M')
+            b = rand(ComplexF64, n); x = similar(b)
             F = specializinglu(A)
-            a = solve_allocs(F, x, b)
-            @test a == 0
+            @test matrixform(F) in (HERMITIAN_INDEFINITE, SYMMETRIC_POSITIVE_DEFINITE)
+            @test refac_allocs(F, A) == 0
+            @test solve_allocs(F, x, b) == 0
         end
     end
 
