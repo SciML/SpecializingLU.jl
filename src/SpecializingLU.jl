@@ -1116,9 +1116,9 @@ function LinearAlgebra.det(F::SpecializedLU{T}) where {T}
         end
         return T(_pivsign(F.ipiv, n) * p)
     elseif form == BANDED
-        # Both the BlasFloat (gbtrf!) and generic (`_banded_lu!`) paths write the
-        # factor into the AB band buffer with the same layout and absolute-index
-        # pivots, so U's diagonal is row kl+ku+1 and `_pivsign` applies uniformly.
+        # `_banded_lu!` (all element types) writes the factor into the AB band
+        # buffer with U's diagonal on row kl+ku+1 and absolute-index pivots, so
+        # `_pivsign` applies uniformly.
         row = F.kl + F.ku + 1
         p = one(T)
         @inbounds for j in 1:n
