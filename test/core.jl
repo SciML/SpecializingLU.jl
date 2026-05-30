@@ -403,6 +403,48 @@ reltol(::Type{T}) where {T} = 1.0e-8
         @test (specializinglu(reshape([5.0], 1, 1)) \ [10.0]) ≈ [2.0]
     end
 
+    @testset "tridiagonal kernel matches lu(Tridiagonal) incl. pivoting" begin
+        for T in (Float64, Float32, ComplexF64, ComplexF32)
+            for trial in 1:3
+                n = 120
+                rv(k) = T <: Complex ? rand(T, k) : randn(T, k)
+                dl, d, du = rv(n - 1), rv(n), rv(n - 1)
+                trial == 2 && (d .*= T(1.0e-6); dl .*= T(1.0e3); du .*= T(1.0e3))  # pivot stress
+                trial == 3 && (d[60] = zero(T))                                    # forces interchange
+                A = Matrix(Tridiagonal(dl, d, du))
+                b = T <: Complex ? rand(T, n) : randn(T, n)
+                # bit-for-bit agreement with LinearAlgebra's tridiagonal LU
+                @test specializinglu(A) \ b == Tridiagonal(dl, d, du) \ b
+                B = T <: Complex ? rand(T, n, 5) : randn(T, n, 5)
+                @test specializinglu(A) \ B == Tridiagonal(dl, d, du) \ B    # multi-RHS too
+            end
+        end
+    end
+
+    @testset "generic tridiagonal/banded are O(n) (not dense LU), exact for Rational" begin
+        # BigFloat tridiagonal / banded now use the hand-rolled kernels, not a
+        # dense O(n^3) fallback; verify form + accuracy.
+        setprecision(BigFloat, 128) do
+            n = 60
+            T = Matrix(Tridiagonal(BigFloat.(randn(n - 1)), BigFloat.(randn(n) .+ 4), BigFloat.(randn(n - 1))))
+            Bnd = Matrix(Tridiagonal(BigFloat.(fill(0.5, n - 1)), BigFloat.(fill(8.0, n)), BigFloat.(fill(0.5, n - 1)))) +
+                diagm(2 => BigFloat.(fill(0.25, n - 2)), -2 => BigFloat.(fill(0.25, n - 2)))
+            b = BigFloat.(randn(n))
+            @test matrixform(specializinglu(T)) == TRIDIAGONAL
+            @test matrixform(specializinglu(Bnd)) == BANDED
+            @test norm(T * (specializinglu(T) \ b) - b) / norm(b) < 1.0e-30
+            @test norm(Bnd * (specializinglu(Bnd) \ b) - b) / norm(b) < 1.0e-30
+        end
+        # Rational stays exact (lutype promotion, not float widening) across forms
+        Atri = Matrix(Tridiagonal([1 // 2, 1 // 3], [2 // 1, 3 // 1, 2 // 1], [1 // 5, 1 // 7]))
+        br = [1 // 1, 2 // 1, 3 // 1]
+        Fr = specializinglu(Atri)
+        @test Fr isa SpecializedLU{Rational{Int}, Rational{Int}}
+        @test matrixform(Fr) == TRIDIAGONAL
+        @test Fr \ br == Atri \ br                # exact rational solve
+        @test Atri * (Fr \ br) == br
+    end
+
     @testset "agreement with LinearAlgebra structured solves" begin
         n = 20
         dl = randn(n - 1); d = randn(n) .+ 4; du = randn(n - 1)
