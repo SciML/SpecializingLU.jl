@@ -12,6 +12,8 @@ export MatrixForm,
     SYMMETRIC_POSITIVE_DEFINITE, SYMMETRIC_INDEFINITE, HERMITIAN_INDEFINITE
 export SpecializedLU, specializinglu, specializinglu!, reserve!, detect_form, DetectionResult,
     matrixform, issuccess, isfactored
+export QRStatus, QR_UNFACTORED, QR_FULLRANK, QR_DEFICIENT
+export SpecializedQR, specializingqr, specializingqr!
 
 # ---------------------------------------------------------------------------
 # Matrix form taxonomy
@@ -1208,6 +1210,797 @@ function LinearAlgebra.det(F::SpecializedLU{T}) where {T}
     end
 end
 
+# ===========================================================================
+# Specialized QR — rank-revealing least-squares / minimum-norm solver
+#
+# A second specializing factorization living in the same module. Where
+# `SpecializedLU` is a square solver that detects *structure*, `SpecializedQR`
+# is a rectangular least-squares solver that detects *rank*: a column-pivoted,
+# rank-revealing QR (LAPACK `geqp3`) reveals the numerical rank, and the solve
+# returns the least-squares / minimum-norm solution for any shape — including
+# singular, rank-deficient, and rectangular `A` — without ever throwing. Like
+# `SpecializedLU` it is one concrete workspace type whose runtime branch is an
+# enum (full-rank vs rank-deficient), so the pipeline is type-stable, and the
+# warm solve is allocation-free (raw LAPACK ccalls reusing persistent buffers).
+# ===========================================================================
+
+"""
+    QRStatus
+
+Enum selecting, at runtime, which [`SpecializedQR`](@ref) solve path applies.
+Like [`MatrixForm`](@ref) it is a value (an `Int8`) rather than a Julia type,
+so [`specializingqr`](@ref) always returns the same concrete `SpecializedQR`.
+
+`QR_FULLRANK` means full *column* rank (`rank == n`, so `n ≤ m`): the solve is
+`Q'b` then a triangular solve with the `n×n` `R`. `QR_DEFICIENT` means
+`rank < n` (rank-deficient *or* underdetermined full-row-rank): the solve uses
+the complete-orthogonal (gelsy) path for the minimum-norm solution, or a
+rank-truncated basic solution. `QR_UNFACTORED` marks a workspace deliberately
+left unfactored (`fallback = false`) for the host to own.
+"""
+@enum QRStatus::Int8 begin
+    QR_UNFACTORED = 0
+    QR_FULLRANK = 1
+    QR_DEFICIENT = 2
+end
+
+"""
+    SpecializedQR{T,R}
+
+A single, concrete, reusable workspace holding a rank-revealing column-pivoted
+QR factorization (`A[:,p] = Q R`) of a possibly rectangular / rank-deficient
+matrix. Its Julia type is fixed (it does not depend on the rank), so
+constructing and solving with it is type-stable; the `status` field selects the
+solve path at runtime.
+
+`solve`/`ldiv!` returns the least-squares solution (minimizing `‖Ax-b‖`) for
+full column rank, and the minimum-norm least-squares solution (matching
+`qr(A, ColumnNorm()) \\ b` and `pinv(A)*b`) when rank-deficient — never
+throwing on singular input. `T` is the element type; `R = real(T)`.
+"""
+mutable struct SpecializedQR{T, R}
+    status::QRStatus
+    m::Int
+    n::Int
+    rank::Int
+    info::Int            # LAPACK illegal-arg only; rank deficiency is NOT an error
+    factored::Bool       # false ⇒ left unfactored for the host (fallback=false)
+    minnorm::Bool        # solve policy on the BlasFloat deficient path
+    rtol::R              # relative tolerance for rank revelation
+    factors::Matrix{T}   # A overwritten by geqp3! (R + reflectors); exact m×n
+    tau::Vector{T}       # geqp3 reflector scalars
+    jpvt::Vector{BlasInt}  # geqp3 column permutation p
+    tzfactors::Matrix{T} # tzrzf! of the leading rank×n trapezoid (min-norm path)
+    tau2::Vector{T}      # tzrzf reflector scalars
+    rhs::Matrix{T}       # padded RHS scratch: exact max(m,n) × nrhs
+    work::Vector{T}      # persistent LAPACK work (geqp3/ormqr/tzrzf/ormrz)
+    rwork::Vector{R}     # complex geqp3 column-norm work
+    wmin::Vector{T}      # laic1 incremental-condition-estimator scratch
+    wmax::Vector{T}
+end
+
+function SpecializedQR{T}() where {T}
+    R = real(T)
+    return SpecializedQR{T, R}(
+        QR_UNFACTORED, 0, 0, 0, 0, false, true, R(0),
+        Matrix{T}(undef, 0, 0), T[], BlasInt[],
+        Matrix{T}(undef, 0, 0), T[],
+        Matrix{T}(undef, 0, 0), T[], R[], T[], T[]
+    )
+end
+
+matrixform(F::SpecializedQR) = F.status
+LinearAlgebra.rank(F::SpecializedQR) = F.rank
+# Rank deficiency is a valid minimum-norm solve, not a failure: only a LAPACK
+# illegal-argument (info ≠ 0) or an unfactored workspace is unsuccessful.
+LinearAlgebra.issuccess(F::SpecializedQR) = F.factored && F.info == 0
+isfactored(F::SpecializedQR) = F.factored
+Base.size(F::SpecializedQR) = (F.m, F.n)
+Base.size(F::SpecializedQR, i::Integer) = i == 1 ? F.m : (i == 2 ? F.n : 1)
+Base.eltype(::SpecializedQR{T}) where {T} = T
+
+function Base.show(io::IO, F::SpecializedQR{T}) where {T}
+    print(io, "SpecializedQR{$T} of size $(F.m)×$(F.n), rank $(F.rank), status = $(F.status)")
+    return F.info == 0 || print(io, " (info=$(F.info))")
+end
+
+_default_rtol(::Type{T}, m::Int, n::Int) where {T} = min(m, n) * eps(real(float(T)))
+
+# Buffer sizing. Like the LU `fact`, the dense buffers are kept EXACT-size: the
+# raw LAPACK solve ccalls write into `rhs`, and a strided sub-view is not always
+# elided on the 1.10 LTS (costing a small allocation), so exact-size real
+# `Matrix`/`Vector` buffers keep the warm solve 0-allocation on every supported
+# Julia version. A change in problem size reallocates them (negligible next to
+# the factorization).
+function _ensure_qr_factors!(F::SpecializedQR{T}, m::Int, n::Int) where {T}
+    if size(F.factors, 1) != m || size(F.factors, 2) != n
+        F.factors = Matrix{T}(undef, m, n)
+    end
+    return F.factors
+end
+
+function _ensure_qr_tzfactors!(F::SpecializedQR{T}, r::Int, n::Int) where {T}
+    if size(F.tzfactors, 1) != r || size(F.tzfactors, 2) != n
+        F.tzfactors = Matrix{T}(undef, r, n)
+    end
+    return F.tzfactors
+end
+
+function _ensure_qr_rhs!(F::SpecializedQR{T}, rows::Int, nrhs::Int) where {T}
+    if size(F.rhs, 1) != rows || size(F.rhs, 2) != nrhs
+        F.rhs = Matrix{T}(undef, rows, nrhs)
+    end
+    return F.rhs
+end
+
+# --- raw LAPACK ccalls (BlasFloat), reusing persistent buffers --------------
+#
+# The stdlib LAPACK wrappers (`geqp3!`, `ormqr!`, `tzrzf!`, `ormrz!`, `laic1!`)
+# each allocate a fresh work buffer / return box on every call (measured: geqp3!
+# ≈14 KB, ormqr! ≈33–67 KB, laic1! a few KB). To keep the warm solve and
+# re-factor allocation-free we call the routines directly through
+# libblastrampoline, reusing `F.work`/`F.tau`/`F.jpvt`/`F.wmin`/`F.wmax` with the
+# same query-then-reuse pattern the LU kernels use for `sytrf`/`getrf`.
+
+# geqp3: rank-revealing QR. `jpvt` MUST be zeroed before the call (a nonzero
+# entry pins that column). Real and complex differ only in the rwork argument.
+for (fname, elty, relty) in (
+        (:dgeqp3_, :Float64, :Float64), (:sgeqp3_, :Float32, :Float32),
+        (:zgeqp3_, :ComplexF64, :Float64), (:cgeqp3_, :ComplexF32, :Float32),
+    )
+    cmplx = !(eval(elty) <: Real)
+    if cmplx
+        @eval function _geqp3_into!(F::SpecializedQR{$elty})
+            m, n = F.m, F.n
+            A = F.factors
+            (m == 0 || n == 0) && return F
+            jpvt = F.jpvt
+            tau = _resize!(F.tau, min(m, n))
+            length(F.rwork) < 2n && _resize!(F.rwork, 2n)
+            length(F.work) >= 1 || _resize!(F.work, 1)
+            info = Ref{BlasInt}()
+            lda = max(1, stride(A, 2))
+            ccall(
+                (@blasfunc($fname), libblastrampoline), Cvoid,
+                (
+                    Ref{BlasInt}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{BlasInt},
+                    Ptr{$elty}, Ptr{$elty}, Ref{BlasInt}, Ptr{$relty}, Ref{BlasInt},
+                ),
+                m, n, A, lda, jpvt, tau, F.work, BlasInt(-1), F.rwork, info
+            )
+            chkargsok(info[])
+            lwork = max(1, Int(real(F.work[1])))
+            length(F.work) < lwork && _resize!(F.work, lwork)
+            ccall(
+                (@blasfunc($fname), libblastrampoline), Cvoid,
+                (
+                    Ref{BlasInt}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{BlasInt},
+                    Ptr{$elty}, Ptr{$elty}, Ref{BlasInt}, Ptr{$relty}, Ref{BlasInt},
+                ),
+                m, n, A, lda, jpvt, tau, F.work, BlasInt(lwork), F.rwork, info
+            )
+            chkargsok(info[])
+            return F
+        end
+    else
+        @eval function _geqp3_into!(F::SpecializedQR{$elty})
+            m, n = F.m, F.n
+            A = F.factors
+            (m == 0 || n == 0) && return F
+            jpvt = F.jpvt
+            tau = _resize!(F.tau, min(m, n))
+            length(F.work) >= 1 || _resize!(F.work, 1)
+            info = Ref{BlasInt}()
+            lda = max(1, stride(A, 2))
+            ccall(
+                (@blasfunc($fname), libblastrampoline), Cvoid,
+                (
+                    Ref{BlasInt}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{BlasInt},
+                    Ptr{$elty}, Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt},
+                ),
+                m, n, A, lda, jpvt, tau, F.work, BlasInt(-1), info
+            )
+            chkargsok(info[])
+            lwork = max(1, Int(real(F.work[1])))
+            length(F.work) < lwork && _resize!(F.work, lwork)
+            ccall(
+                (@blasfunc($fname), libblastrampoline), Cvoid,
+                (
+                    Ref{BlasInt}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{BlasInt},
+                    Ptr{$elty}, Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt},
+                ),
+                m, n, A, lda, jpvt, tau, F.work, BlasInt(lwork), info
+            )
+            chkargsok(info[])
+            return F
+        end
+    end
+end
+
+# ormqr/unmqr: apply Qᴴ (side='L'). `nrows` is the number of rows Q acts on (m),
+# passed explicitly so the padded `C` buffer's leading dim is used as ldc — see
+# the LU `fact` exact-size note: a slicing view would cost a small allocation.
+for (fname, elty) in (
+        (:dormqr_, :Float64), (:sormqr_, :Float32),
+        (:zunmqr_, :ComplexF64), (:cunmqr_, :ComplexF32),
+    )
+    @eval function _ormqr_into!(
+            F::SpecializedQR{$elty}, A::AbstractMatrix{$elty}, tau::Vector{$elty},
+            k::Int, C::AbstractMatrix{$elty}, nrows::Int, trans::AbstractChar
+        )
+        m = nrows
+        n = size(C, 2)
+        (m == 0 || k == 0) && return C
+        lda = max(1, stride(A, 2))
+        ldc = max(1, stride(C, 2))
+        length(F.work) >= 1 || _resize!(F.work, 1)
+        info = Ref{BlasInt}()
+        ccall(
+            (@blasfunc($fname), libblastrampoline), Cvoid,
+            (
+                Ref{UInt8}, Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt}, Ref{BlasInt},
+                Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ptr{$elty}, Ref{BlasInt},
+                Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}, Clong, Clong,
+            ),
+            'L', trans, m, n, k, A, lda, tau, C, ldc, F.work, BlasInt(-1), info, 1, 1
+        )
+        chkargsok(info[])
+        lwork = max(1, Int(real(F.work[1])))
+        length(F.work) < lwork && _resize!(F.work, lwork)
+        ccall(
+            (@blasfunc($fname), libblastrampoline), Cvoid,
+            (
+                Ref{UInt8}, Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt}, Ref{BlasInt},
+                Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ptr{$elty}, Ref{BlasInt},
+                Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}, Clong, Clong,
+            ),
+            'L', trans, m, n, k, A, lda, tau, C, ldc, F.work, BlasInt(lwork), info, 1, 1
+        )
+        chkargsok(info[])
+        return C
+    end
+end
+
+# tzrzf/ztzrzf: complete the leading r×n trapezoid to r×r upper-triangular T11
+# via an orthogonal Z (the gelsy minimum-norm step).
+for (fname, elty) in (
+        (:dtzrzf_, :Float64), (:stzrzf_, :Float32),
+        (:ztzrzf_, :ComplexF64), (:ctzrzf_, :ComplexF32),
+    )
+    @eval function _tzrzf_into!(F::SpecializedQR{$elty}, A::AbstractMatrix{$elty}, tau::Vector{$elty})
+        m, n = size(A)
+        m == 0 && return A
+        lda = max(1, stride(A, 2))
+        length(F.work) >= 1 || _resize!(F.work, 1)
+        info = Ref{BlasInt}()
+        ccall(
+            (@blasfunc($fname), libblastrampoline), Cvoid,
+            (Ref{BlasInt}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}),
+            m, n, A, lda, tau, F.work, BlasInt(-1), info
+        )
+        chkargsok(info[])
+        lwork = max(1, Int(real(F.work[1])))
+        length(F.work) < lwork && _resize!(F.work, lwork)
+        ccall(
+            (@blasfunc($fname), libblastrampoline), Cvoid,
+            (Ref{BlasInt}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}),
+            m, n, A, lda, tau, F.work, BlasInt(lwork), info
+        )
+        chkargsok(info[])
+        return A
+    end
+end
+
+# ormrz/unmrz: apply Zᴴ (side='L') to lift the r-vector to the min-norm n-vector.
+for (fname, elty) in (
+        (:dormrz_, :Float64), (:sormrz_, :Float32),
+        (:zunmrz_, :ComplexF64), (:cunmrz_, :ComplexF32),
+    )
+    @eval function _ormrz_into!(
+            F::SpecializedQR{$elty}, A::AbstractMatrix{$elty}, tau::Vector{$elty},
+            k::Int, l::Int, C::AbstractMatrix{$elty}, nrows::Int, trans::AbstractChar
+        )
+        m = nrows
+        n = size(C, 2)
+        (m == 0 || k == 0) && return C
+        lda = max(1, stride(A, 2))
+        ldc = max(1, stride(C, 2))
+        length(F.work) >= 1 || _resize!(F.work, 1)
+        info = Ref{BlasInt}()
+        ccall(
+            (@blasfunc($fname), libblastrampoline), Cvoid,
+            (
+                Ref{UInt8}, Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt}, Ref{BlasInt}, Ref{BlasInt},
+                Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ptr{$elty}, Ref{BlasInt},
+                Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}, Clong, Clong,
+            ),
+            'L', trans, m, n, k, l, A, lda, tau, C, ldc, F.work, BlasInt(-1), info, 1, 1
+        )
+        chkargsok(info[])
+        lwork = max(1, Int(real(F.work[1])))
+        length(F.work) < lwork && _resize!(F.work, lwork)
+        ccall(
+            (@blasfunc($fname), libblastrampoline), Cvoid,
+            (
+                Ref{UInt8}, Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt}, Ref{BlasInt}, Ref{BlasInt},
+                Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ptr{$elty}, Ref{BlasInt},
+                Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}, Clong, Clong,
+            ),
+            'L', trans, m, n, k, l, A, lda, tau, C, ldc, F.work, BlasInt(lwork), info, 1, 1
+        )
+        chkargsok(info[])
+        return C
+    end
+end
+
+# trtrs: triangular solve (no work buffer). Solves the leading nA×nA block.
+for (fname, elty) in (
+        (:dtrtrs_, :Float64), (:strtrs_, :Float32),
+        (:ztrtrs_, :ComplexF64), (:ctrtrs_, :ComplexF32),
+    )
+    @eval function _trtrs_into!(
+            ::SpecializedQR{$elty}, uplo::AbstractChar, A::AbstractMatrix{$elty},
+            B::AbstractMatrix{$elty}, nA::Int
+        )
+        nA == 0 && return B
+        nrhs = size(B, 2)
+        lda = max(1, stride(A, 2))
+        ldb = max(1, stride(B, 2))
+        info = Ref{BlasInt}()
+        ccall(
+            (@blasfunc($fname), libblastrampoline), Cvoid,
+            (
+                Ref{UInt8}, Ref{UInt8}, Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt},
+                Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}, Clong, Clong, Clong,
+            ),
+            uplo, 'N', 'N', nA, nrhs, A, lda, B, ldb, info, 1, 1, 1
+        )
+        chkargsok(info[])
+        return B
+    end
+end
+
+# laic1/zlaic1: incremental condition estimator. `Ref`s do not escape, so the
+# compiler elides them (0-alloc), exactly like the LU `sytrf` info/query Refs.
+for (fname, elty, relty) in (
+        (:dlaic1_, :Float64, :Float64), (:slaic1_, :Float32, :Float32),
+        (:zlaic1_, :ComplexF64, :Float64), (:claic1_, :ComplexF32, :Float32),
+    )
+    @eval @inline function _laic1(
+            ::Type{$elty}, job::Int, x::AbstractVector{$elty}, sest::$relty,
+            w::AbstractVector{$elty}, gamma::$elty
+        )
+        j = length(x)
+        sestpr = Ref{$relty}()
+        s = Ref{$elty}()
+        c = Ref{$elty}()
+        ccall(
+            (@blasfunc($fname), libblastrampoline), Cvoid,
+            (
+                Ref{BlasInt}, Ref{BlasInt}, Ptr{$elty}, Ref{$relty}, Ptr{$elty},
+                Ref{$elty}, Ref{$relty}, Ref{$elty}, Ref{$elty},
+            ),
+            job, j, x, sest, w, gamma, sestpr, s, c
+        )
+        return sestpr[], s[], c[]
+    end
+end
+
+# --- work-buffer reservation ------------------------------------------------
+
+_reserve_qr_work!(F::SpecializedQR, ::Int, ::Int; deficient::Bool = false) = F
+
+# Size F.work to the max optimal lwork over geqp3/ormqr (and tzrzf/ormrz when
+# `deficient`). No-op for non-BlasFloat element types (generic path, no work).
+for (geqp3f, ormqrf, tzrzff, ormrzf, elty, relty) in (
+        (:dgeqp3_, :dormqr_, :dtzrzf_, :dormrz_, :Float64, :Float64),
+        (:sgeqp3_, :sormqr_, :stzrzf_, :sormrz_, :Float32, :Float32),
+        (:zgeqp3_, :zunmqr_, :ztzrzf_, :zunmrz_, :ComplexF64, :Float64),
+        (:cgeqp3_, :cunmqr_, :ctzrzf_, :cunmrz_, :ComplexF32, :Float32),
+    )
+    cmplx = !(eval(elty) <: Real)
+    @eval function _reserve_qr_work!(F::SpecializedQR{$elty}, m::Int, n::Int; deficient::Bool = false)
+        (m == 0 || n == 0) && return F
+        mn = min(m, n)
+        A = _ensure_qr_factors!(F, m, n)
+        lda = max(1, stride(A, 2))
+        length(F.work) >= 1 || _resize!(F.work, 1)
+        $(cmplx ? :(length(F.rwork) < 2n && _resize!(F.rwork, 2n)) : :nothing)
+        info = Ref{BlasInt}()
+        tau = _resize!(F.tau, mn)
+        jpvt = _resize!(F.jpvt, n)
+        lwork = 1
+        # geqp3 query
+        $(
+            if cmplx
+                quote
+                    ccall(
+                        (@blasfunc($geqp3f), libblastrampoline), Cvoid,
+                        (
+                            Ref{BlasInt}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{BlasInt},
+                            Ptr{$elty}, Ptr{$elty}, Ref{BlasInt}, Ptr{$relty}, Ref{BlasInt},
+                        ),
+                        m, n, A, lda, jpvt, tau, F.work, BlasInt(-1), F.rwork, info
+                    )
+                end
+            else
+                quote
+                    ccall(
+                        (@blasfunc($geqp3f), libblastrampoline), Cvoid,
+                        (
+                            Ref{BlasInt}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{BlasInt},
+                            Ptr{$elty}, Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt},
+                        ),
+                        m, n, A, lda, jpvt, tau, F.work, BlasInt(-1), info
+                    )
+                end
+            end
+        )
+        lwork = max(lwork, Int(real(F.work[1])))
+        # ormqr query (apply Qᴴ to a single column padded to max(m,n) rows)
+        rhs = _ensure_qr_rhs!(F, max(m, n), 1)
+        ldc = max(1, stride(rhs, 2))
+        ccall(
+            (@blasfunc($ormqrf), libblastrampoline), Cvoid,
+            (
+                Ref{UInt8}, Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt}, Ref{BlasInt},
+                Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ptr{$elty}, Ref{BlasInt},
+                Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}, Clong, Clong,
+            ),
+            'L', 'N', m, 1, mn, A, lda, tau, rhs, ldc, F.work, BlasInt(-1), info, 1, 1
+        )
+        lwork = max(lwork, Int(real(F.work[1])))
+        if deficient
+            tzf = _ensure_qr_tzfactors!(F, mn, n)
+            ldt = max(1, stride(tzf, 2))
+            tau2 = _resize!(F.tau2, mn)
+            ccall(
+                (@blasfunc($tzrzff), libblastrampoline), Cvoid,
+                (Ref{BlasInt}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}),
+                mn, n, tzf, ldt, tau2, F.work, BlasInt(-1), info
+            )
+            lwork = max(lwork, Int(real(F.work[1])))
+            ccall(
+                (@blasfunc($ormrzf), libblastrampoline), Cvoid,
+                (
+                    Ref{UInt8}, Ref{UInt8}, Ref{BlasInt}, Ref{BlasInt}, Ref{BlasInt}, Ref{BlasInt},
+                    Ptr{$elty}, Ref{BlasInt}, Ptr{$elty}, Ptr{$elty}, Ref{BlasInt},
+                    Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}, Clong, Clong,
+                ),
+                'L', 'N', n, 1, mn, n - mn, tzf, ldt, tau2, rhs, ldc, F.work, BlasInt(-1), info, 1, 1
+            )
+            lwork = max(lwork, Int(real(F.work[1])))
+        end
+        lwork = max(1, lwork)
+        length(F.work) < lwork && _resize!(F.work, lwork)
+        return F
+    end
+end
+
+"""
+    reserve!(F::SpecializedQR, m, n; deficient = false, nrhs = 1) -> F
+
+Grow `F`'s buffers so a problem of size up to `m×n` (with up to `nrhs`
+right-hand sides) factors and solves with **zero** allocations. Pass
+`deficient = true` to also reserve the complete-orthogonal (`tzrzf`) buffers and
+the larger work needed by the rank-deficient minimum-norm solve. Buffers only
+ever grow within the exact-size dense buffers' footprint, so reserving the
+largest problem you will solve makes every later `specializingqr!` + `ldiv!` at
+that size or smaller allocation-free.
+"""
+function reserve!(F::SpecializedQR{T}, m::Integer, n::Integer; deficient::Bool = false, nrhs::Integer = 1) where {T}
+    mm = Int(m)
+    nn = Int(n)
+    mn = min(mm, nn)
+    _ensure_qr_factors!(F, mm, nn)
+    _resize!(F.tau, mn)
+    _resize!(F.jpvt, nn)
+    _resize!(F.tau2, mn)
+    _ensure_qr_rhs!(F, max(mm, nn), Int(nrhs))
+    _resize!(F.wmin, mn)
+    _resize!(F.wmax, mn)
+    if T <: Complex
+        _resize!(F.rwork, 2nn)
+    end
+    if deficient
+        _ensure_qr_tzfactors!(F, mn, nn)
+    end
+    _reserve_qr_work!(F, mm, nn; deficient = deficient)
+    return F
+end
+
+"""
+    SpecializedQR{T}(m, n; deficient = false, nrhs = 1)
+
+Construct a workspace with buffers pre-sized (via [`reserve!`](@ref)) for an
+`m×n` matrix of element type `T`, so that subsequent factorizations and solves
+at size ≤ `m×n` are allocation-free.
+"""
+SpecializedQR{T}(m::Integer, n::Integer; deficient::Bool = false, nrhs::Integer = 1) where {T} =
+    reserve!(SpecializedQR{T}(), m, n; deficient = deficient, nrhs = nrhs)
+
+# --- rank detection ---------------------------------------------------------
+
+# BlasFloat: laic1 incremental condition estimator (the gelsy algorithm Julia's
+# QRPivoted ldiv! uses), so the revealed rank — and hence the solution — matches
+# `qr(A, ColumnNorm())` and `pinv`. Allocation-free (reuses F.wmin/F.wmax).
+function _detect_rank!(F::SpecializedQR{T}) where {T <: BlasFloat}
+    m, n = F.m, F.n
+    mn = min(m, n)
+    A = F.factors
+    rcond = F.rtol
+    (mn == 0 || length(A) == 0) && return 0
+    R = real(T)
+    smax = R(abs(A[1, 1]))
+    smin = smax
+    smax == 0 && return 0
+    wmin = _resize!(F.wmin, mn)
+    wmax = _resize!(F.wmax, mn)
+    @inbounds for k in 1:mn
+        wmin[k] = zero(T)
+        wmax[k] = zero(T)
+    end
+    wmin[1] = one(T)
+    wmax[1] = one(T)
+    rnk = 1
+    @inbounds while rnk < mn
+        i = rnk + 1
+        gamma = A[i, i]
+        sminpr, s1, c1 = _laic1(T, 2, view(wmin, 1:rnk), smin, view(A, 1:rnk, i), gamma)
+        smaxpr, s2, c2 = _laic1(T, 1, view(wmax, 1:rnk), smax, view(A, 1:rnk, i), gamma)
+        smaxpr * rcond > sminpr && break
+        for k in 1:rnk
+            wmin[k] *= s1
+            wmax[k] *= s2
+        end
+        wmin[i] = c1
+        wmax[i] = c2
+        smin = sminpr
+        smax = smaxpr
+        rnk += 1
+    end
+    return rnk
+end
+
+# Generic: diagonal threshold. Column pivoting makes |R[i,i]| non-increasing, so
+# the rank is the count of diagonal entries above the tolerance.
+function _detect_rank_generic(A::AbstractMatrix{T}, m::Int, n::Int, rtol) where {T}
+    mn = min(m, n)
+    mn == 0 && return 0
+    rmax = abs(A[1, 1])
+    rmax == 0 && return 0
+    tol = rmax * rtol
+    rnk = 0
+    @inbounds for i in 1:mn
+        abs(A[i, i]) > tol || break
+        rnk += 1
+    end
+    return rnk
+end
+
+# --- factorization ----------------------------------------------------------
+
+"""
+    specializingqr(A; rtol = min(m,n)*eps, minnorm = true, fallback = true) -> SpecializedQR
+
+Compute a rank-revealing column-pivoted QR factorization of the (possibly
+rectangular / rank-deficient) matrix `A`, returning a [`SpecializedQR`](@ref)
+workspace. Always returns the same concrete type regardless of `A`'s shape or
+rank (type-stable).
+
+`F \\ b` / `ldiv!(x, F, b)` then returns the least-squares solution
+(minimizing `‖Ax-b‖`); when `A` is rank-deficient it returns the **minimum-norm**
+least-squares solution (matching `qr(A, ColumnNorm()) \\ b` and `pinv(A)*b`) and
+**never throws** on singular input. `rtol` sets the relative tolerance for rank
+revelation; `minnorm = false` selects the cheaper rank-truncated *basic*
+solution (free variables zeroed) on the `BlasFloat` path; `fallback = false`
+leaves the workspace unfactored for a host that wants to own the QR.
+
+Integer / `Rational` element types are promoted via `float` (QR requires square
+roots, so an exact-rational QR is not possible); `BigFloat` and other generic
+element types use a generic column-pivoted QR with a rank-truncated *basic*
+solve (the generic path returns the basic, not the minimum-norm, solution).
+"""
+function specializingqr(A::AbstractMatrix{T}; kwargs...) where {T}
+    S = float(T)
+    F = SpecializedQR{S}()
+    Af = S === T ? A : convert(AbstractMatrix{S}, A)
+    return specializingqr!(F, Af; kwargs...)
+end
+
+"""
+    specializingqr!(F::SpecializedQR, A; rtol = -1, minnorm = true, fallback = true) -> F
+
+Re-factor `A` into the existing workspace `F`, reusing (and growing only as
+needed) `F`'s buffers. `rtol < 0` uses the default `min(m,n)*eps(real(T))`. See
+[`specializingqr`](@ref) for the keyword semantics.
+"""
+function specializingqr!(
+        F::SpecializedQR{T}, A::AbstractMatrix{T};
+        rtol::Real = -1, minnorm::Bool = true, fallback::Bool = true
+    ) where {T}
+    m, n = size(A)
+    F.m = m
+    F.n = n
+    F.info = 0
+    F.minnorm = minnorm
+    F.rtol = rtol < 0 ? _default_rtol(T, m, n) : real(T)(rtol)
+    if !fallback
+        F.factored = false
+        F.status = QR_UNFACTORED
+        F.rank = 0
+        return F
+    end
+    F.factored = true
+    _factorize_qr!(F, A)
+    return F
+end
+
+# BlasFloat: rank-revealing geqp3 + laic1 rank + (deficient min-norm) tzrzf prep.
+function _factorize_qr!(F::SpecializedQR{T}, A::AbstractMatrix{T}) where {T <: BlasFloat}
+    m, n = F.m, F.n
+    C = _ensure_qr_factors!(F, m, n)
+    copyto!(C, A)
+    _resize!(F.jpvt, n)
+    fill!(F.jpvt, 0)            # 0 ⇒ free pivoting (true rank revelation)
+    _geqp3_into!(F)
+    r = _detect_rank!(F)
+    F.rank = r
+    F.status = r == n ? QR_FULLRANK : QR_DEFICIENT
+    # Prepare the complete-orthogonal factor once per factorization (reused over
+    # right-hand sides) for the minimum-norm deficient solve.
+    if F.status == QR_DEFICIENT && F.minnorm && 0 < r < n
+        tzf = _ensure_qr_tzfactors!(F, r, n)
+        @inbounds for j in 1:n, i in 1:r
+            tzf[i, j] = C[i, j]
+        end
+        _resize!(F.tau2, r)
+        _tzrzf_into!(F, tzf, F.tau2)
+    end
+    return F
+end
+
+# Generic element types: generic column-pivoted QR stored in the same fields.
+function _factorize_qr!(F::SpecializedQR{T}, A::AbstractMatrix{T}) where {T}
+    m, n = F.m, F.n
+    fac = qr(A, ColumnNorm())
+    C = _ensure_qr_factors!(F, m, n)
+    copyto!(C, fac.factors)
+    nt = length(fac.τ)
+    _resize!(F.tau, nt)
+    copyto!(F.tau, fac.τ)
+    _resize!(F.jpvt, n)
+    @inbounds for i in 1:n
+        F.jpvt[i] = fac.p[i]
+    end
+    r = _detect_rank_generic(C, m, n, F.rtol)
+    F.rank = r
+    F.status = r == n ? QR_FULLRANK : QR_DEFICIENT
+    return F
+end
+
+# --- solving ----------------------------------------------------------------
+
+"""
+    ldiv!(x, F::SpecializedQR, b) -> x
+
+Solve the least-squares problem `min ‖A x - b‖` using the rank-revealing QR
+stored in `F`, writing the solution into `x` (`length(x) == size(A, 2)`,
+`length(b) == size(A, 1)`). For rank-deficient `A` this is the minimum-norm
+least-squares solution (basic if `minnorm = false`, or on the generic path).
+`b` may be a vector or a matrix (multiple right-hand sides). Never throws on
+singular `A`.
+"""
+function LinearAlgebra.ldiv!(x::AbstractVecOrMat, F::SpecializedQR, b::AbstractVecOrMat)
+    F.factored || throw(
+        ArgumentError(
+            "SpecializedQR holds an unfactored matrix (fallback=false); the host " *
+                "must supply its own QR. Check `isfactored(F)` / `matrixform(F)` first."
+        )
+    )
+    size(b, 1) == F.m || throw(DimensionMismatch("rhs has $(size(b, 1)) rows, expected $(F.m)"))
+    size(x, 1) == F.n || throw(DimensionMismatch("solution has $(size(x, 1)) rows, expected $(F.n)"))
+    size(x, 2) == size(b, 2) || throw(DimensionMismatch("x and b have different right-hand-side counts"))
+    _qr_solve!(x, F, b)
+    return x
+end
+
+# In-place: only valid for square systems (x and b share length). Rectangular
+# shapes must use the 3-arg form with a properly-sized x.
+function LinearAlgebra.ldiv!(F::SpecializedQR, b::AbstractVecOrMat)
+    F.m == F.n || throw(
+        DimensionMismatch("2-arg ldiv!(F, b) requires a square system; use ldiv!(x, F, b) with size(x,1)==$(F.n)")
+    )
+    return ldiv!(b, F, b)
+end
+
+function Base.:\(F::SpecializedQR{T}, b::AbstractVecOrMat) where {T}
+    x = b isa AbstractVector ? Vector{T}(undef, F.n) : Matrix{T}(undef, F.n, size(b, 2))
+    return ldiv!(x, F, b)
+end
+
+@inline function _scatter_perm!(x::AbstractVector, rhs::AbstractMatrix, jpvt, n::Int)
+    @inbounds for i in 1:n
+        x[jpvt[i]] = rhs[i, 1]
+    end
+    return x
+end
+
+@inline function _scatter_perm!(x::AbstractMatrix, rhs::AbstractMatrix, jpvt, n::Int)
+    @inbounds for c in axes(x, 2), i in 1:n
+        x[jpvt[i], c] = rhs[i, c]
+    end
+    return x
+end
+
+# Copy b into the padded rhs buffer (leading dim max(m,n)); rows m+1:end zeroed.
+@inline function _load_rhs!(F::SpecializedQR{T}, b::AbstractVecOrMat) where {T}
+    m = F.m
+    nrhs = size(b, 2)
+    rhs = _ensure_qr_rhs!(F, max(m, F.n), nrhs)
+    fill!(rhs, zero(T))
+    if b isa AbstractVector
+        @inbounds for i in 1:m
+            rhs[i, 1] = b[i]
+        end
+    else
+        @inbounds for c in 1:nrhs, i in 1:m
+            rhs[i, c] = b[i, c]
+        end
+    end
+    return rhs
+end
+
+function _qr_solve!(x::AbstractVecOrMat, F::SpecializedQR{T}, b::AbstractVecOrMat) where {T <: BlasFloat}
+    m, n, r = F.m, F.n, F.rank
+    fill!(x, zero(T))
+    r == 0 && return x
+    rhs = _load_rhs!(F, b)
+    trans = T <: Complex ? 'C' : 'T'
+    _ormqr_into!(F, F.factors, F.tau, min(m, n), rhs, m, trans)
+    if F.status == QR_FULLRANK
+        _trtrs_into!(F, 'U', F.factors, rhs, n)
+    elseif F.minnorm && r < n
+        _trtrs_into!(F, 'U', F.tzfactors, rhs, r)
+        nrhs = size(rhs, 2)
+        @inbounds for c in 1:nrhs, i in (r + 1):n
+            rhs[i, c] = zero(T)
+        end
+        _ormrz_into!(F, F.tzfactors, F.tau2, r, n - r, rhs, n, trans)
+    else  # basic (rank-truncated) solution: free variables zeroed
+        _trtrs_into!(F, 'U', F.factors, rhs, r)
+        nrhs = size(rhs, 2)
+        @inbounds for c in 1:nrhs, i in (r + 1):n
+            rhs[i, c] = zero(T)
+        end
+    end
+    _scatter_perm!(x, rhs, F.jpvt, n)
+    return x
+end
+
+# Generic: rank-truncated basic solve (Julia's generic QRPivoted ldiv! is NOT
+# rank-safe and blows up on singular input, so we do our own rank truncation).
+function _qr_solve!(x::AbstractVecOrMat, F::SpecializedQR{T}, b::AbstractVecOrMat) where {T}
+    m, n, r = F.m, F.n, F.rank
+    fill!(x, zero(T))
+    r == 0 && return x
+    Q = LinearAlgebra.QRPackedQ(F.factors, F.tau)
+    qtb = Q' * b
+    Rtri = UpperTriangular(view(F.factors, 1:r, 1:r))
+    if b isa AbstractVector
+        y = Rtri \ view(qtb, 1:r)
+        @inbounds for i in 1:r
+            x[F.jpvt[i]] = y[i]
+        end
+    else
+        y = Rtri \ qtb[1:r, :]
+        @inbounds for c in axes(x, 2), i in 1:r
+            x[F.jpvt[i], c] = y[i, c]
+        end
+    end
+    return x
+end
+
 # ---------------------------------------------------------------------------
 # Precompilation — exercise every form and solve path for all four BlasFloat
 # element types so the first real solve is fast (no first-call latency).
@@ -1260,6 +2053,23 @@ end
             end
             detect_form(Agen)
             specializinglu(Agen; fallback_lu = false)
+
+            # QR: full-rank square/over/under and a rank-deficient case, with
+            # the minimum-norm and basic solve paths.
+            Asq = [cv(i == j ? n + 1 : 1 / (i + 2j), i == j ? 0 : 1 / (i + j + 1)) for i in 1:n, j in 1:n]
+            Aover = [cv(1 / (i + j), 1 / (i + 2j + 1)) for i in 1:(n + 2), j in 1:n]
+            Aunder = [cv(1 / (i + j), 1 / (i + 2j + 1)) for i in 1:n, j in 1:(n + 2)]
+            Adef = [cv(i, 0) * cv(j, 0) + cv((-1)^(i + j), 0) for i in 1:n, j in 1:n]
+            for (A, mm, nn) in ((Asq, n, n), (Aover, n + 2, n), (Aunder, n, n + 2), (Adef, n, n))
+                bq = ones(T, mm)
+                xq = ones(T, nn)
+                Q = specializingqr(A)
+                Q \ bq
+                ldiv!(xq, Q, bq)
+                rank(Q)
+                specializingqr(A; minnorm = false)
+            end
+            specializingqr(Asq; fallback = false)
         end
     end
 end

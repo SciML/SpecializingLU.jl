@@ -521,3 +521,213 @@ reltol(::Type{T}) where {T} = 1.0e-8
         @test specializinglu(L) \ b ≈ LowerTriangular(L) \ b
     end
 end
+
+# ===========================================================================
+# SpecializedQR — rank-revealing least-squares / minimum-norm solver
+# ===========================================================================
+
+# correct-typed random matrix/vector, and an exact-rank-r factor product.
+_qrand(::Type{T}, dims...) where {T <: Complex} = T.(complex.(randn(dims...), randn(dims...)))
+_qrand(::Type{T}, dims...) where {T <: Real} = T.(randn(dims...))
+_lowrank(::Type{T}, m, n, r) where {T} = _qrand(T, m, r) * _qrand(T, r, n)
+_reltol(::Type{T}) where {T} = (real(T) === Float32 ? 1.0f-3 : 1.0e-8)
+
+@testset "SpecializedQR (rank-revealing least-squares)" begin
+
+    @testset "full-rank LS matches qr(ColumnNorm) and pinv: $T, $shape" for
+        T in (Float64, Float32, ComplexF64, ComplexF32),
+            shape in (:square, :over, :under)
+
+        m, n = shape === :square ? (5, 5) : (shape === :over ? (7, 4) : (4, 7))
+        A = _qrand(T, m, n)
+        b = _qrand(T, m)
+        F = specializingqr(A)
+        x = F \ b
+        @test length(x) == n
+        # full COLUMN rank (rank == n) is QR_FULLRANK; an underdetermined system
+        # at full ROW rank (rank == m < n) takes the min-norm path → QR_DEFICIENT.
+        @test matrixform(F) == (n <= m ? QR_FULLRANK : QR_DEFICIENT)
+        @test rank(F) == min(m, n)
+        @test issuccess(F)
+        @test x ≈ qr(A, ColumnNorm()) \ b rtol = _reltol(T)
+        @test x ≈ pinv(A) * b rtol = _reltol(T)
+        # the normal equations hold: Aᴴ(Ax-b) ≈ 0
+        @test norm(A' * (A * x - b)) < _reltol(T) * max(1, norm(A)^2)
+    end
+
+    @testset "rank-deficient min-norm matches pinv: $T, $shape" for
+        T in (Float64, Float32, ComplexF64, ComplexF32),
+            shape in (:square, :over, :under)
+
+        m, n = shape === :square ? (6, 6) : (shape === :over ? (7, 5) : (5, 8))
+        r = 3
+        A = _lowrank(T, m, n, r)
+        b = _qrand(T, m)
+        F = specializingqr(A)              # minnorm = true (default)
+        x = F \ b
+        @test length(x) == n
+        @test matrixform(F) == QR_DEFICIENT
+        @test rank(F) == r
+        @test issuccess(F)                 # rank deficiency is NOT a failure
+        @test x ≈ pinv(A) * b rtol = _reltol(T)
+        @test x ≈ qr(A, ColumnNorm()) \ b rtol = _reltol(T)
+        # min-norm: no other LS solution has smaller norm (compare to basic)
+        xbasic = specializingqr(A; minnorm = false) \ b
+        @test norm(A' * (A * xbasic - b)) < _reltol(T) * max(1, norm(A)^2)  # valid LS
+        @test norm(x) <= norm(xbasic) + _reltol(T)                          # min-norm ≤ basic
+    end
+
+    @testset "singular / zero / rank-0 / empty never throw: $T" for
+        T in (Float64, Float32, ComplexF64, ComplexF32)
+
+        for (m, n) in ((3, 3), (2, 4), (4, 2))
+            A = zeros(T, m, n)
+            b = _qrand(T, m)
+            F = specializingqr(A)
+            x = F \ b
+            @test iszero(x)
+            @test length(x) == n
+            @test rank(F) == 0
+            @test issuccess(F)
+            @test x ≈ pinv(A) * b
+        end
+        # empty inputs
+        let F = specializingqr(zeros(T, 0, 0))
+            @test length(F \ zeros(T, 0)) == 0
+            @test rank(F) == 0
+        end
+        let F = specializingqr(zeros(T, 0, 3))     # 0×3: x has length 3, all zero
+            x = F \ zeros(T, 0)
+            @test length(x) == 3 && iszero(x)
+        end
+    end
+
+    @testset "multiple right-hand sides: $T" for T in (Float64, ComplexF64)
+        A = _lowrank(T, 7, 5, 3)
+        B = _qrand(T, 7, 4)
+        F = specializingqr(A)
+        X = F \ B
+        @test size(X) == (5, 4)
+        @test X ≈ pinv(A) * B rtol = _reltol(T)
+        # column-wise consistency with single-RHS solves
+        for c in 1:4
+            @test X[:, c] ≈ F \ B[:, c] rtol = _reltol(T)
+        end
+    end
+
+    @testset "type stability — one concrete type for every shape/rank" begin
+        for T in (Float64, ComplexF64)
+            for A in (_qrand(T, 5, 5), _qrand(T, 7, 4), _qrand(T, 4, 7), _lowrank(T, 6, 6, 2))
+                @test (@inferred specializingqr(A)) isa SpecializedQR{T, real(T)}
+            end
+            A = _qrand(T, 7, 4); b = _qrand(T, 7); F = specializingqr(A)
+            x = Vector{T}(undef, 4)
+            @test (@inferred ldiv!(x, F, b)) === x
+            @test (@inferred F \ b) isa Vector{T}
+        end
+    end
+
+    @testset "zero allocations after setup (warm solve + refactor): $T" for
+        T in (Float64, Float32, ComplexF64, ComplexF32)
+
+        @noinline solv(x, F, b) = (ldiv!(x, F, b); @allocated ldiv!(x, F, b))
+        @noinline refac(F, A) = (specializingqr!(F, A); @allocated specializingqr!(F, A))
+        m, n = 8, 5
+        # full column rank
+        let A = _qrand(T, m, n), b = _qrand(T, m)
+            F = SpecializedQR{T}(m, n)
+            specializingqr!(F, A)
+            x = Vector{T}(undef, n)
+            @test matrixform(F) == QR_FULLRANK
+            @test solv(x, F, b) == 0
+            @test refac(F, A) == 0
+        end
+        # rank-deficient (min-norm path: tzrzf/ormrz), buffers reserved upfront
+        let A = _lowrank(T, m, n, 2), b = _qrand(T, m)
+            F = SpecializedQR{T}(m, n; deficient = true)
+            specializingqr!(F, A)
+            x = Vector{T}(undef, n)
+            @test matrixform(F) == QR_DEFICIENT
+            @test solv(x, F, b) == 0
+            @test refac(F, A) == 0
+        end
+    end
+
+    @testset "reserve! makes smaller subsequent solves 0-alloc" begin
+        @noinline solv(x, F, b) = (ldiv!(x, F, b); @allocated ldiv!(x, F, b))
+        F = SpecializedQR{Float64}()
+        reserve!(F, 64, 32; deficient = true, nrhs = 1)
+        for (m, n, r) in ((64, 32, 32), (40, 20, 8), (50, 25, 25))
+            A = r == n ? _qrand(Float64, m, n) : _lowrank(Float64, m, n, r)
+            b = randn(m); x = Vector{Float64}(undef, n)
+            specializingqr!(F, A)
+            @test solv(x, F, b) == 0
+            @test norm(A' * (A * (F \ b) - b)) < 1.0e-7 * max(1, norm(A)^2)
+        end
+    end
+
+    @testset "rtol keyword controls revealed rank" begin
+        # A matrix with one deliberately tiny (but nonzero) singular value.
+        U, _ = qr(randn(6, 6)); V, _ = qr(randn(6, 6))
+        s = [1.0, 0.5, 0.25, 0.1, 1.0e-9, 1.0e-12]
+        A = Matrix(U) * Diagonal(s) * Matrix(V)'
+        @test rank(specializingqr(A; rtol = 1.0e-6)) == 4   # drops the 1e-9 and 1e-12
+        @test rank(specializingqr(A; rtol = 1.0e-10)) == 5  # keeps 1e-9, drops 1e-12
+        @test rank(specializingqr(A; rtol = 1.0e-14)) == 6  # keeps all
+    end
+
+    @testset "agreement with Base \\ for tall full-rank (LS)" begin
+        A = randn(20, 8); b = randn(20)
+        @test specializingqr(A) \ b ≈ A \ b rtol = 1.0e-8
+        Ac = randn(ComplexF64, 15, 6); bc = randn(ComplexF64, 15)
+        @test specializingqr(Ac) \ bc ≈ Ac \ bc rtol = 1.0e-8
+    end
+
+    @testset "generic (non-BLAS) element type: BigFloat" begin
+        # rank-deficient: Julia's generic QRPivoted \\ blows up here (≈4e76);
+        # our rank-truncated fallback returns a valid LS solution and never throws.
+        let A = BigFloat[1 1; 1 1], b = BigFloat[2, 3]
+            F = specializingqr(A)
+            x = F \ b
+            @test rank(F) == 1
+            @test norm(A' * (A * x - b)) < 1.0e-60
+            @test all(isfinite, x)
+        end
+        # full-rank overdetermined: matches the exact reference
+        let A = BigFloat.(randn(6, 3)), b = BigFloat.(randn(6))
+            @test norm(specializingqr(A) \ b - (A \ b)) < 1.0e-60
+        end
+        # zero matrix: zeros, no throw
+        let F = specializingqr(zeros(BigFloat, 3, 3))
+            @test iszero(F \ BigFloat.(randn(3)))
+            @test rank(F) == 0
+        end
+    end
+
+    @testset "integer / rational eltypes promote (QR needs sqrt)" begin
+        Ai = [2 1 0; 1 3 1; 0 1 2]; bi = [1, 2, 3]
+        F = specializingqr(Ai)
+        @test eltype(F) === Float64
+        @test F \ bi ≈ Float64.(Ai) \ Float64.(bi)
+        Ar = Rational{Int}[1 2; 2 4]; br = Rational{Int}[1, 2]
+        Fr = specializingqr(Ar)        # promotes to Float64 (no exact rational QR)
+        @test eltype(Fr) === Float64
+        @test rank(Fr) == 1
+        @test norm(Float64.(Ar)' * (Float64.(Ar) * (Fr \ br) - Float64.(br))) < 1.0e-10
+    end
+
+    @testset "fallback = false leaves the QR to the host" begin
+        A = randn(6, 4)
+        F = specializingqr(A; fallback = false)
+        @test !isfactored(F)
+        @test matrixform(F) == QR_UNFACTORED
+        @test_throws ArgumentError ldiv!(zeros(4), F, ones(6))
+    end
+
+    @testset "dimension mismatches throw" begin
+        A = randn(6, 4); F = specializingqr(A)
+        @test_throws DimensionMismatch ldiv!(zeros(4), F, ones(5))   # wrong rhs rows
+        @test_throws DimensionMismatch ldiv!(zeros(3), F, ones(6))   # wrong x rows
+        @test_throws DimensionMismatch ldiv!(F, ones(6))             # 2-arg needs square
+    end
+end

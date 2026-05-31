@@ -55,3 +55,25 @@ let Agen = _matrix(:general, N), Asym = _matrix(:spd, N)
     SUITE["detect"]["general"] = @benchmarkable detect_form($Agen)
     SUITE["detect"]["symmetric"] = @benchmarkable detect_form($Asym)
 end
+
+# Rank-revealing QR: full-rank overdetermined / underdetermined and a
+# rank-deficient case, across factorization, warm solve (0-alloc), and full.
+SUITE["qr_factorize"] = BenchmarkGroup()
+SUITE["qr_solve"] = BenchmarkGroup()       # warm in-place ldiv! — must stay 0-alloc
+SUITE["qr_full"] = BenchmarkGroup()
+
+let cases = (
+        "over_full" => randn(N, N ÷ 2),
+        "under_full" => randn(N ÷ 2, N),
+        "deficient" => randn(N, 8) * randn(8, N),   # N×N, rank 8
+    )
+    for (name, A) in cases
+        m, n = size(A)
+        b = ones(m)
+        x = Vector{Float64}(undef, n)
+        F = specializingqr(A)
+        SUITE["qr_factorize"][name] = @benchmarkable specializingqr($A)
+        SUITE["qr_solve"][name] = @benchmarkable ldiv!($x, $F, $b)
+        SUITE["qr_full"][name] = @benchmarkable specializingqr($A) \ $b
+    end
+end
