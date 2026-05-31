@@ -1,8 +1,8 @@
-using SpecializingLU
+using SpecializingFactorizations
 using LinearAlgebra
 using Test
 
-const SLU = SpecializingLU
+const SLU = SpecializingFactorizations
 
 # Build representative matrices for each form (square, well-conditioned).
 function make(form::MatrixForm, ::Type{T}, n::Int) where {T}
@@ -52,7 +52,7 @@ reltol(::Type{Float32}) = 1.0e-3
 reltol(::Type{ComplexF32}) = 1.0e-3
 reltol(::Type{T}) where {T} = 1.0e-8
 
-@testset "SpecializingLU.jl" begin
+@testset "SpecializingFactorizations.jl" begin
 
     @testset "detection: form + bandwidth" begin
         n = 10

@@ -1,4 +1,4 @@
-# SpecializingLU.jl
+# SpecializingFactorizations.jl
 
 A **type-stable**, single-workspace dense linear solver that cheaply detects
 whether a dense matrix actually has special structure and, if so, solves with
@@ -9,7 +9,7 @@ It is the type-stable analogue of
 [`SparseMatrixIdentification.jl`](https://github.com/SciML/SparseMatrixIdentification.jl):
 that package detects structure by returning different *Julia types*
 (`Diagonal`, `Tridiagonal`, …), which is inherently **type-unstable** — the
-compiler cannot infer which factorization you will get. `SpecializingLU`
+compiler cannot infer which factorization you will get. `SpecializingFactorizations`
 instead tags the structure with a runtime **enum** and stores every
 factorization in **one concrete workspace type**, so detection → factor →
 solve is fully inferable and allocation-free on the hot path.
@@ -20,7 +20,7 @@ solve is fully inferable and allocation-free on the hot path.
 # SparseMatrixIdentification-style: return type depends on the data → unstable
 f(A) = specialize(A)          # ::Diagonal OR ::Tridiagonal OR ::Matrix ... ?
 
-# SpecializingLU: always the same concrete type, branch chosen by an enum field
+# SpecializingFactorizations: always the same concrete type, branch chosen by an enum field
 specializinglu(A)::SpecializedLU{T,R}     # always
 ```
 
@@ -70,7 +70,7 @@ wasted.
 ## Usage
 
 ```julia
-using SpecializingLU, LinearAlgebra
+using SpecializingFactorizations, LinearAlgebra
 
 A = Tridiagonal(rand(99), rand(100) .+ 4, rand(99)) |> Matrix   # a dense Matrix
 b = rand(100)
@@ -190,7 +190,7 @@ specialized factor/solve for matched forms, and route the `GENERAL` branch to
 LinearSolve's own tuned dense LU. The mechanics of that wiring
 (`init_cacheval` → `do_factorization` → the generic `solve!` calling
 `ldiv!(u, F, b)`) are a thin LinearSolve-side adapter; the default
-(`fallback_lu = true`) keeps `SpecializingLU` a complete standalone solver.
+(`fallback_lu = true`) keeps `SpecializingFactorizations` a complete standalone solver.
 
 ## Limitations
 
