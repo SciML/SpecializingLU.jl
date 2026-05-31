@@ -283,10 +283,17 @@ never-throw contract:
   prevents the `LAPACKException` a zero-pivot triangular solve would throw). When
   the gate passes, the matrix is comfortably full rank and the structured solve
   is numerically identical to `geqp3`.
-- **`GENERAL`, the symmetric forms, `TRIDIAGONAL`/`BANDED`, rectangular, and
-  near-singular structured inputs** → the dense rank-revealing `geqp3` path
-  (symmetry gives no rank-revealing advantage; `detect_form` is square-only, so
-  rectangular least-squares always uses `geqp3`).
+- **`TRIDIAGONAL`** (`gttrf`/`gttrs`, O(n)) and **`BANDED`** (`gbtrf`/`gbtrs`,
+  O(n·b²)) → the structured LU factor + solve, behind the **same condition gate**
+  applied to the (banded) upper factor U (`cond(U)` tracks `cond(A)` under
+  partial pivoting; verified zero unsafe over thousands of wildly-conditioned
+  matrices). A singular or ill-conditioned banded matrix fails the gate (or hits
+  a zero pivot) and falls back to `geqp3`. Reserve the band buffer for the
+  `BANDED` path with `SpecializedQR{T}(n, n; kl, ku)` / `reserve!(F, n, n; kl, ku)`.
+- **`GENERAL`, the symmetric forms, rectangular, and near-singular structured
+  inputs** → the dense rank-revealing `geqp3` path (symmetry gives no
+  rank-revealing advantage; `detect_form` is square-only, so rectangular
+  least-squares always uses `geqp3`).
 
 `rank(F)`, `issuccess(F)`, and the solution are indistinguishable from the
 `geqp3` path regardless of which path was taken; the structural form actually

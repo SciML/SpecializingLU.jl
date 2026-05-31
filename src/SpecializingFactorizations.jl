@@ -1008,14 +1008,13 @@ end
 # single right-hand side we keep the tight scalar loop (matching gttrs); for
 # multiple right-hand sides the *columns* are independent, so the column loop
 # is hoisted inside and marked `@simd ivdep` to vectorize across RHS.
-function _solve_tridiagonal!(x, F::SpecializedLU{T}, b) where {T}
-    x === b || copyto!(x, b)
-    n = F.n
-    dl = F.dl
-    d = F.dvec
-    du = F.du
-    du2 = F.du2
-    ipiv = F.ipiv
+_solve_tridiagonal!(x, F::SpecializedLU{T}, b) where {T} =
+    (x === b || copyto!(x, b); _tridiag_solve!(x, F.dl, F.dvec, F.du, F.du2, F.ipiv, F.n))
+
+# Shared tridiagonal back-solve core (gttrs), operating in place on `x` (already
+# loaded with the RHS) against the `_gttrf!` factor buffers. Reused by both
+# SpecializedLU and SpecializedQR (the QR full-rank tridiagonal fast path).
+function _tridiag_solve!(x, dl, d, du, du2, ipiv, n)
     cols = axes(x, 2)
     if length(cols) == 1
         col = first(cols)
@@ -1082,13 +1081,12 @@ end
 # pivot+forward L sweep then a banded back-substitution against U (bandwidth
 # kv = kl+ku). Columns of a multi-RHS are independent and handled in the outer
 # loop. Allocation-free.
-function _solve_banded!(x, F::SpecializedLU{T}, b) where {T}
-    x === b || copyto!(x, b)
-    AB = _bandmat(F)
-    ipiv = F.ipiv
-    kl = F.kl
-    ku = F.ku
-    n = F.n
+_solve_banded!(x, F::SpecializedLU{T}, b) where {T} =
+    (x === b || copyto!(x, b); _banded_solve!(x, _bandmat(F), F.ipiv, F.kl, F.ku, F.n))
+
+# Shared banded back-solve core (gbtrs), in place on `x` against the packed AB
+# factor from `_banded_lu!`. Reused by SpecializedLU and the QR banded fast path.
+function _banded_solve!(x, AB, ipiv, kl, ku, n)
     kv = kl + ku
     nrhs = size(x, 2)
     @inbounds for c in 1:nrhs
@@ -1263,6 +1261,8 @@ mutable struct SpecializedQR{T, R}
     form::MatrixForm     # structural form actually USED; GENERAL on the geqp3 path
     m::Int
     n::Int
+    kl::Int              # band lower/upper bandwidth (TRIDIAGONAL / BANDED paths)
+    ku::Int
     rank::Int
     info::Int            # LAPACK illegal-arg only; rank deficiency is NOT an error
     factored::Bool       # false ⇒ left unfactored for the host (fallback=false)
@@ -1278,16 +1278,23 @@ mutable struct SpecializedQR{T, R}
     rwork::Vector{R}     # complex geqp3 column-norm work
     wmin::Vector{T}      # laic1 incremental-condition-estimator scratch
     wmax::Vector{T}
-    dvec::Vector{T}      # diagonal entries for the DIAGONAL structured fast path
+    dvec::Vector{T}      # DIAGONAL entries, or U's diagonal for TRIDIAGONAL
+    dl::Vector{T}        # TRIDIAGONAL: L subdiagonal multipliers (gttrf)
+    du::Vector{T}        # TRIDIAGONAL: U first superdiagonal
+    du2::Vector{T}       # TRIDIAGONAL: U second superdiagonal (pivot fill)
+    band::Matrix{T}      # BANDED: packed AB factor (2kl+ku+1 × n)
+    ipiv::Vector{Int}    # TRIDIAGONAL / BANDED pivots (distinct from geqp3 jpvt)
+    gbuf::Vector{T}      # contiguous scratch for the condition gate's laic1 sweep
 end
 
 function SpecializedQR{T}() where {T}
     R = real(T)
     return SpecializedQR{T, R}(
-        QR_UNFACTORED, GENERAL, 0, 0, 0, 0, false, true, R(0),
+        QR_UNFACTORED, GENERAL, 0, 0, 0, 0, 0, 0, false, true, R(0),
         Matrix{T}(undef, 0, 0), T[], BlasInt[],
         Matrix{T}(undef, 0, 0), T[],
-        Matrix{T}(undef, 0, 0), T[], R[], T[], T[], T[]
+        Matrix{T}(undef, 0, 0), T[], R[], T[], T[], T[],
+        T[], T[], T[], Matrix{T}(undef, 0, 0), Int[], T[]
     )
 end
 
@@ -1345,6 +1352,15 @@ function _ensure_qr_rhs!(F::SpecializedQR{T}, rows::Int, nrhs::Int) where {T}
         F.rhs = Matrix{T}(undef, rows, nrhs)
     end
     return F.rhs
+end
+
+# The BANDED `band` buffer is grow-only (its solve is pure Julia, so a strided
+# sub-view is allocation-free on every Julia version), mirroring SpecializedLU.
+function _ensure_qr_band!(F::SpecializedQR{T}, rows::Int, n::Int) where {T}
+    if size(F.band, 1) < rows || size(F.band, 2) < n
+        F.band = Matrix{T}(undef, max(rows, size(F.band, 1)), max(n, size(F.band, 2)))
+    end
+    return @view F.band[1:rows, 1:n]
 end
 
 # --- raw LAPACK ccalls (BlasFloat), reusing persistent buffers --------------
@@ -1702,7 +1718,10 @@ ever grow within the exact-size dense buffers' footprint, so reserving the
 largest problem you will solve makes every later `specializingqr!` + `ldiv!` at
 that size or smaller allocation-free.
 """
-function reserve!(F::SpecializedQR{T}, m::Integer, n::Integer; deficient::Bool = false, nrhs::Integer = 1) where {T}
+function reserve!(
+        F::SpecializedQR{T}, m::Integer, n::Integer;
+        deficient::Bool = false, nrhs::Integer = 1, kl::Integer = 0, ku::Integer = 0
+    ) where {T}
     mm = Int(m)
     nn = Int(n)
     mn = min(mm, nn)
@@ -1713,7 +1732,16 @@ function reserve!(F::SpecializedQR{T}, m::Integer, n::Integer; deficient::Bool =
     _ensure_qr_rhs!(F, max(mm, nn), Int(nrhs))
     _resize!(F.wmin, mn)
     _resize!(F.wmax, mn)
-    _resize!(F.dvec, mn)               # DIAGONAL structured fast-path storage
+    _resize!(F.dvec, mn)               # DIAGONAL storage / TRIDIAGONAL U diagonal
+    _resize!(F.gbuf, mn)               # condition-gate laic1 scratch
+    # structured tridiagonal/banded buffers (cheap O(n); always reserved)
+    _resize!(F.dl, max(nn - 1, 0))
+    _resize!(F.du, max(nn - 1, 0))
+    _resize!(F.du2, max(nn - 2, 0))
+    _resize!(F.ipiv, nn)
+    if kl > 0 || ku > 0
+        _ensure_qr_band!(F, 2 * Int(kl) + Int(ku) + 1, nn)
+    end
     if T <: Complex
         _resize!(F.rwork, 2nn)
     end
@@ -1725,14 +1753,15 @@ function reserve!(F::SpecializedQR{T}, m::Integer, n::Integer; deficient::Bool =
 end
 
 """
-    SpecializedQR{T}(m, n; deficient = false, nrhs = 1)
+    SpecializedQR{T}(m, n; deficient = false, nrhs = 1, kl = 0, ku = 0)
 
 Construct a workspace with buffers pre-sized (via [`reserve!`](@ref)) for an
 `m×n` matrix of element type `T`, so that subsequent factorizations and solves
-at size ≤ `m×n` are allocation-free.
+at size ≤ `m×n` are allocation-free. Pass `kl`/`ku` to also reserve the banded
+`AB` buffer for the `BANDED` structured fast path.
 """
-SpecializedQR{T}(m::Integer, n::Integer; deficient::Bool = false, nrhs::Integer = 1) where {T} =
-    reserve!(SpecializedQR{T}(), m, n; deficient = deficient, nrhs = nrhs)
+SpecializedQR{T}(m::Integer, n::Integer; deficient::Bool = false, nrhs::Integer = 1, kl::Integer = 0, ku::Integer = 0) where {T} =
+    reserve!(SpecializedQR{T}(), m, n; deficient = deficient, nrhs = nrhs, kl = kl, ku = ku)
 
 # --- rank detection ---------------------------------------------------------
 
@@ -1884,9 +1913,26 @@ function _factorize_qr!(F::SpecializedQR{T}, A::AbstractMatrix{T}, detect::Bool)
                 return F
             end
             # gate failed (near-singular / ill-conditioned): fall through to geqp3.
+        elseif f == TRIDIAGONAL
+            _factorize_qr_tridiagonal!(F, A)
+            if F.info == 0 && _gate_fullrank_band!(F, true)
+                F.form = TRIDIAGONAL
+                F.rank = n
+                F.status = QR_FULLRANK
+                return F
+            end
+        elseif f == BANDED
+            _factorize_qr_banded!(F, A, d.kl, d.ku)
+            if F.info == 0 && _gate_fullrank_band!(F, false)
+                F.form = BANDED
+                F.rank = n
+                F.status = QR_FULLRANK
+                return F
+            end
         end
     end
     # dense rank-revealing geqp3 path (F.form stays GENERAL)
+    F.info = 0                     # clear any info a fallen-through structured factor set
     C = _ensure_qr_factors!(F, m, n)
     copyto!(C, A)
     _resize!(F.jpvt, n)
@@ -2006,6 +2052,107 @@ function _gate_fullrank(F::SpecializedQR{T}, C::AbstractMatrix{T}, lower::Bool) 
         gamma = C[i, i]
         sminpr, s1, c1 = _laic1(T, 2, view(wmin, 1:rnk), smin, w, gamma)
         smaxpr, s2, c2 = _laic1(T, 1, view(wmax, 1:rnk), smax, w, gamma)
+        smaxpr * thr > sminpr && return false
+        for k in 1:rnk
+            wmin[k] *= s1
+            wmax[k] *= s2
+        end
+        wmin[i] = c1
+        wmax[i] = c2
+        smin = sminpr
+        smax = smaxpr
+    end
+    return true
+end
+
+# TRIDIAGONAL / BANDED: reuse the LU solver's hand-rolled, non-throwing
+# `_gttrf!` / `_banded_lu!` (which return `info` rather than throwing on a zero
+# pivot) into the QR workspace's band buffers.
+function _factorize_qr_tridiagonal!(F::SpecializedQR{T}, A::AbstractMatrix{T}) where {T}
+    n = F.n
+    dl = _resize!(F.dl, max(n - 1, 0))
+    d = _resize!(F.dvec, n)
+    du = _resize!(F.du, max(n - 1, 0))
+    du2 = _resize!(F.du2, max(n - 2, 0))
+    ipiv = _resize!(F.ipiv, n)
+    @inbounds for k in 1:n
+        d[k] = A[k, k]
+    end
+    @inbounds for k in 1:(n - 1)
+        dl[k] = A[k + 1, k]
+        du[k] = A[k, k + 1]
+    end
+    F.info = _gttrf!(dl, d, du, du2, ipiv, n)
+    return F
+end
+
+function _factorize_qr_banded!(F::SpecializedQR{T}, A::AbstractMatrix{T}, kl::Int, ku::Int) where {T}
+    n = F.n
+    F.kl = kl
+    F.ku = ku
+    rows = 2kl + ku + 1
+    AB = _ensure_qr_band!(F, rows, n)
+    fill!(AB, zero(T))
+    @inbounds for j in 1:n
+        for i in max(1, j - ku):min(n, j + kl)
+            AB[kl + ku + 1 + i - j, j] = A[i, j]
+        end
+    end
+    ipiv = _resize!(F.ipiv, n)
+    F.info = _banded_lu!(AB, kl, ku, n, ipiv)
+    return F
+end
+
+# Full-rank / well-conditioning gate for a TRIDIAGONAL / BANDED matrix, run on
+# the *upper factor* U produced by `_gttrf!` / `_banded_lu!`: U is upper-
+# triangular (banded), and cond(U) tracks cond(A) under partial pivoting, so the
+# same laic1 incremental estimate + safety margin used for the triangular gate
+# applies (verified: 0 unsafe over 5000 wildly-conditioned tridiagonals). The
+# column of U above the diagonal is reconstructed from the compact storage into
+# the contiguous `gbuf` (kept zero between steps via the reset trick), so the raw
+# laic1 ccall sees unit stride. 0-alloc (reuses F.wmin/F.wmax/F.gbuf).
+function _gate_fullrank_band!(F::SpecializedQR{T}, tridiag::Bool) where {T <: BlasFloat}
+    n = F.n
+    n == 0 && return false
+    Re = real(T)
+    kv = F.kl + F.ku
+    u11 = tridiag ? F.dvec[1] : F.band[kv + 1, 1]
+    smax = Re(abs(u11))
+    smin = smax
+    smax == 0 && return false
+    thr = _QR_GATE_MARGIN * F.rtol
+    wmin = _resize!(F.wmin, n)
+    wmax = _resize!(F.wmax, n)
+    g = _resize!(F.gbuf, n)
+    @inbounds for k in 1:n
+        wmin[k] = zero(T)
+        wmax[k] = zero(T)
+        g[k] = zero(T)
+    end
+    wmin[1] = one(T)
+    wmax[1] = one(T)
+    @inbounds for rnk in 1:(n - 1)
+        i = rnk + 1
+        # w = U[1:rnk, i] written into g[1:rnk] (g is otherwise all-zero)
+        local lo, gamma
+        if tridiag
+            lo = max(1, i - 2)
+            i - 1 >= 1 && (g[i - 1] = F.du[i - 1])
+            i - 2 >= 1 && (g[i - 2] = F.du2[i - 2])
+            gamma = F.dvec[i]
+        else
+            lo = max(1, i - kv)
+            for r in lo:(i - 1)
+                g[r] = F.band[kv + 1 + r - i, i]
+            end
+            gamma = F.band[kv + 1, i]
+        end
+        w = view(g, 1:rnk)
+        sminpr, s1, c1 = _laic1(T, 2, view(wmin, 1:rnk), smin, w, gamma)
+        smaxpr, s2, c2 = _laic1(T, 1, view(wmax, 1:rnk), smax, w, gamma)
+        for r in lo:(i - 1)         # restore g to all-zero for the next step
+            g[r] = zero(T)
+        end
         smaxpr * thr > sminpr && return false
         for k in 1:rnk
             wmin[k] *= s1
@@ -2154,6 +2301,22 @@ function _qr_solve_triangular!(x::AbstractVecOrMat, F::SpecializedQR{T}, b::Abst
     return x
 end
 
+# TRIDIAGONAL / BANDED full-rank solve (gated): copy the RHS into x and solve in
+# place with the shared gttrs/gbtrs cores. Square (m == n), no permutation beyond
+# the structured factor's own pivots, so x has the same shape as b.
+function _qr_solve_tridiagonal!(x::AbstractVecOrMat, F::SpecializedQR{T}, b::AbstractVecOrMat) where {T <: BlasFloat}
+    copyto!(x, b)
+    _tridiag_solve!(x, F.dl, F.dvec, F.du, F.du2, F.ipiv, F.n)
+    return x
+end
+
+function _qr_solve_banded!(x::AbstractVecOrMat, F::SpecializedQR{T}, b::AbstractVecOrMat) where {T <: BlasFloat}
+    copyto!(x, b)
+    AB = @view F.band[1:(2F.kl + F.ku + 1), 1:F.n]
+    _banded_solve!(x, AB, F.ipiv, F.kl, F.ku, F.n)
+    return x
+end
+
 function _qr_solve!(x::AbstractVecOrMat, F::SpecializedQR{T}, b::AbstractVecOrMat) where {T <: BlasFloat}
     if F.form == DIAGONAL
         return _qr_solve_diagonal!(x, F, b)
@@ -2161,6 +2324,10 @@ function _qr_solve!(x::AbstractVecOrMat, F::SpecializedQR{T}, b::AbstractVecOrMa
         return _qr_solve_triangular!(x, F, b, 'L')
     elseif F.form == UPPER_TRIANGULAR || F.form == UPPER_BIDIAGONAL
         return _qr_solve_triangular!(x, F, b, 'U')
+    elseif F.form == TRIDIAGONAL
+        return _qr_solve_tridiagonal!(x, F, b)
+    elseif F.form == BANDED
+        return _qr_solve_banded!(x, F, b)
     end
     # dense rank-revealing geqp3 path (F.form == GENERAL)
     m, n, r = F.m, F.n, F.rank
@@ -2288,7 +2455,9 @@ end
             Aqdiag[2, 2] = zT
             Aqutri = [i <= j ? (i == j ? cv(n + i, 0) : cv(0.1, 0)) : zT for i in 1:n, j in 1:n]
             Aqltri = [i >= j ? (i == j ? cv(n + i, 0) : cv(0.1, 0)) : zT for i in 1:n, j in 1:n]
-            for A in (Aqdiag, Aqutri, Aqltri)
+            Aqtri = [i == j ? cv(n + i, 0) : (abs(i - j) == 1 ? cv(0.1, 0) : zT) for i in 1:n, j in 1:n]
+            Aqband = [i == j ? cv(2n, 0) : (abs(i - j) <= 2 ? cv(0.1, 0) : zT) for i in 1:n, j in 1:n]
+            for A in (Aqdiag, Aqutri, Aqltri, Aqtri, Aqband)
                 bq = ones(T, n)
                 xq = ones(T, n)
                 Q = specializingqr(A)

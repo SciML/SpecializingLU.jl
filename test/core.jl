@@ -745,8 +745,16 @@ _reltol(::Type{T}) where {T} = (real(T) === Float32 ? 1.0f-3 : 1.0e-8)
             return T[i > j ? off() : (i == j ? dom() : zero(T)) for i in 1:n, j in 1:n]
         elseif form == UPPER_BIDIAGONAL
             return Matrix(Bidiagonal(T[dom() for _ in 1:n], T[off() for _ in 1:(n - 1)], :U))
-        else # LOWER_BIDIAGONAL
+        elseif form == LOWER_BIDIAGONAL
             return Matrix(Bidiagonal(T[dom() for _ in 1:n], T[off() for _ in 1:(n - 1)], :L))
+        elseif form == TRIDIAGONAL
+            return Matrix(Tridiagonal(T[off() for _ in 1:(n - 1)], T[dom() for _ in 1:n], T[off() for _ in 1:(n - 1)]))
+        else # BANDED (pentadiagonal)
+            return diagm(
+                0 => T[dom() for _ in 1:n],
+                1 => T[off() for _ in 1:(n - 1)], -1 => T[off() for _ in 1:(n - 1)],
+                2 => T[off() for _ in 1:(n - 2)], -2 => T[off() for _ in 1:(n - 2)],
+            )
         end
     end
 
@@ -754,7 +762,7 @@ _reltol(::Type{T}) where {T} = (real(T) === Float32 ? 1.0f-3 : 1.0e-8)
         T in (Float64, Float32, ComplexF64, ComplexF32),
             form in (
                 DIAGONAL, UPPER_TRIANGULAR, LOWER_TRIANGULAR,
-                UPPER_BIDIAGONAL, LOWER_BIDIAGONAL,
+                UPPER_BIDIAGONAL, LOWER_BIDIAGONAL, TRIDIAGONAL, BANDED,
             )
 
         n = 9
@@ -837,6 +845,30 @@ _reltol(::Type{T}) where {T} = (real(T) === Float32 ? 1.0f-3 : 1.0e-8)
             @test Fz \ bz ≈ pinv(U) * bz rtol = 1.0e-9
             @test rank(Fz) == 2
         end
+
+        # rank-deficient tridiagonal (two identical rows ⇒ rank 2 of 3): the
+        # hand-rolled gttrf would otherwise divide by a zero pivot; must fall back.
+        let A = Matrix(Tridiagonal([1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0])), bt = [1.0, 2.0, 3.0]
+            Ft = specializingqr(A)
+            @test structuralform(Ft) == GENERAL
+            @test all(isfinite, Ft \ bt)
+            @test Ft \ bt ≈ pinv(A) * bt rtol = 1.0e-9
+            @test rank(Ft) == rank(specializingqr(A; detect_structure = false))
+        end
+        # ill-conditioned banded full-rank-but-past-rtol: gate must route to geqp3.
+        let nb = 30
+            A = diagm(
+                0 => 10.0 .^ range(0, -16; length = nb),
+                1 => fill(1.0, nb - 1), -1 => fill(1.0, nb - 1),
+                2 => fill(1.0, nb - 2), -2 => fill(1.0, nb - 2),
+            )
+            bb = randn(nb)
+            Fb = specializingqr(A)
+            Fbg = specializingqr(A; detect_structure = false)
+            @test rank(Fb) == rank(Fbg)
+            @test Fb \ bb ≈ Fbg \ bb rtol = 1.0e-7
+            @test all(isfinite, Fb \ bb)
+        end
     end
 
     @testset "structured paths: 0 allocations (warm solve + refactor): $T" for
@@ -845,10 +877,14 @@ _reltol(::Type{T}) where {T} = (real(T) === Float32 ? 1.0f-3 : 1.0e-8)
         @noinline solv(x, F, b) = (ldiv!(x, F, b); @allocated ldiv!(x, F, b))
         @noinline refac(F, A) = (specializingqr!(F, A); @allocated specializingqr!(F, A))
         n = 10
-        for form in (DIAGONAL, UPPER_TRIANGULAR, LOWER_TRIANGULAR, UPPER_BIDIAGONAL, LOWER_BIDIAGONAL)
+        for form in (
+                DIAGONAL, UPPER_TRIANGULAR, LOWER_TRIANGULAR,
+                UPPER_BIDIAGONAL, LOWER_BIDIAGONAL, TRIDIAGONAL, BANDED,
+            )
             A = _struct_mat(form, T, n)
             b = _qrand(T, n)
-            F = SpecializedQR{T}(n, n)
+            # reserve the band buffer for the BANDED path (kl=ku=2 pentadiagonal)
+            F = form == BANDED ? SpecializedQR{T}(n, n; kl = 2, ku = 2) : SpecializedQR{T}(n, n)
             specializingqr!(F, A)
             x = Vector{T}(undef, n)
             @test structuralform(F) == form
