@@ -13,7 +13,7 @@ export MatrixForm,
 export SpecializedLU, specializinglu, specializinglu!, reserve!, detect_form, DetectionResult,
     matrixform, issuccess, isfactored
 export QRStatus, QR_UNFACTORED, QR_FULLRANK, QR_DEFICIENT
-export SpecializedQR, specializingqr, specializingqr!
+export SpecializedQR, specializingqr, specializingqr!, structuralform
 
 # ---------------------------------------------------------------------------
 # Matrix form taxonomy
@@ -1260,6 +1260,7 @@ throwing on singular input. `T` is the element type; `R = real(T)`.
 """
 mutable struct SpecializedQR{T, R}
     status::QRStatus
+    form::MatrixForm     # structural form actually USED; GENERAL on the geqp3 path
     m::Int
     n::Int
     rank::Int
@@ -1277,19 +1278,32 @@ mutable struct SpecializedQR{T, R}
     rwork::Vector{R}     # complex geqp3 column-norm work
     wmin::Vector{T}      # laic1 incremental-condition-estimator scratch
     wmax::Vector{T}
+    dvec::Vector{T}      # diagonal entries for the DIAGONAL structured fast path
 end
 
 function SpecializedQR{T}() where {T}
     R = real(T)
     return SpecializedQR{T, R}(
-        QR_UNFACTORED, 0, 0, 0, 0, false, true, R(0),
+        QR_UNFACTORED, GENERAL, 0, 0, 0, 0, false, true, R(0),
         Matrix{T}(undef, 0, 0), T[], BlasInt[],
         Matrix{T}(undef, 0, 0), T[],
-        Matrix{T}(undef, 0, 0), T[], R[], T[], T[]
+        Matrix{T}(undef, 0, 0), T[], R[], T[], T[], T[]
     )
 end
 
 matrixform(F::SpecializedQR) = F.status
+
+"""
+    structuralform(F::SpecializedQR) -> MatrixForm
+
+The structural [`MatrixForm`](@ref) that `F`'s solve actually uses: `DIAGONAL`,
+`LOWER_TRIANGULAR`/`UPPER_TRIANGULAR` (also covering the bidiagonal forms, which
+are triangular), or `GENERAL` for the dense rank-revealing `geqp3` path (used for
+unstructured, symmetric, rectangular, near-singular/ill-conditioned-structured,
+and `detect_structure = false` inputs). Introspection only — the solve,
+`rank(F)`, and `issuccess(F)` are numerically identical regardless of path.
+"""
+structuralform(F::SpecializedQR) = F.form
 LinearAlgebra.rank(F::SpecializedQR) = F.rank
 # Rank deficiency is a valid minimum-norm solve, not a failure: only a LAPACK
 # illegal-argument (info ≠ 0) or an unfactored workspace is unsuccessful.
@@ -1699,6 +1713,7 @@ function reserve!(F::SpecializedQR{T}, m::Integer, n::Integer; deficient::Bool =
     _ensure_qr_rhs!(F, max(mm, nn), Int(nrhs))
     _resize!(F.wmin, mn)
     _resize!(F.wmax, mn)
+    _resize!(F.dvec, mn)               # DIAGONAL structured fast-path storage
     if T <: Complex
         _resize!(F.rwork, 2nn)
     end
@@ -1809,21 +1824,26 @@ function specializingqr(A::AbstractMatrix{T}; kwargs...) where {T}
 end
 
 """
-    specializingqr!(F::SpecializedQR, A; rtol = -1, minnorm = true, fallback = true) -> F
+    specializingqr!(F::SpecializedQR, A; rtol = -1, minnorm = true, fallback = true,
+                    detect_structure = true) -> F
 
 Re-factor `A` into the existing workspace `F`, reusing (and growing only as
 needed) `F`'s buffers. `rtol < 0` uses the default `min(m,n)*eps(real(T))`. See
-[`specializingqr`](@ref) for the keyword semantics.
+[`specializingqr`](@ref) for the keyword semantics. `detect_structure = false`
+disables the structured fast paths and forces the dense rank-revealing `geqp3`
+path for every input (the pre-structure behavior).
 """
 function specializingqr!(
         F::SpecializedQR{T}, A::AbstractMatrix{T};
-        rtol::Real = -1, minnorm::Bool = true, fallback::Bool = true
+        rtol::Real = -1, minnorm::Bool = true, fallback::Bool = true,
+        detect_structure::Bool = true
     ) where {T}
     m, n = size(A)
     F.m = m
     F.n = n
     F.info = 0
     F.minnorm = minnorm
+    F.form = GENERAL
     F.rtol = rtol < 0 ? _default_rtol(T, m, n) : real(T)(rtol)
     if !fallback
         F.factored = false
@@ -1832,13 +1852,41 @@ function specializingqr!(
         return F
     end
     F.factored = true
-    _factorize_qr!(F, A)
+    _factorize_qr!(F, A, detect_structure)
     return F
 end
 
-# BlasFloat: rank-revealing geqp3 + laic1 rank + (deficient min-norm) tzrzf prep.
-function _factorize_qr!(F::SpecializedQR{T}, A::AbstractMatrix{T}) where {T <: BlasFloat}
+# BlasFloat: structure-aware. Square inputs are classified by `detect_form`; a
+# DIAGONAL matrix uses the exact O(n) rank-revealing diagonal solve, and a
+# triangular/bidiagonal matrix uses a triangular solve *only* when a conservative
+# condition gate certifies it is comfortably full rank (so the structured solve
+# provably equals geqp3/pinv). Everything else — unstructured, symmetric,
+# rectangular, near-singular structured, tridiagonal/banded — falls through to
+# the dense rank-revealing geqp3 path, which guarantees the rank + min-norm +
+# never-throw contract.
+function _factorize_qr!(F::SpecializedQR{T}, A::AbstractMatrix{T}, detect::Bool) where {T <: BlasFloat}
     m, n = F.m, F.n
+    if detect && m == n && m > 0
+        d = detect_form(A)
+        f = d.form
+        if f == DIAGONAL
+            return _factorize_qr_diagonal!(F, A)
+        elseif f == LOWER_TRIANGULAR || f == UPPER_TRIANGULAR ||
+                f == LOWER_BIDIAGONAL || f == UPPER_BIDIAGONAL
+            C = _ensure_qr_factors!(F, n, n)
+            copyto!(C, A)            # a triangular A IS its own R
+            lower = f == LOWER_TRIANGULAR || f == LOWER_BIDIAGONAL
+            if _gate_fullrank(F, C, lower)
+                F.form = f
+                F.info = 0
+                F.rank = n
+                F.status = QR_FULLRANK
+                return F
+            end
+            # gate failed (near-singular / ill-conditioned): fall through to geqp3.
+        end
+    end
+    # dense rank-revealing geqp3 path (F.form stays GENERAL)
     C = _ensure_qr_factors!(F, m, n)
     copyto!(C, A)
     _resize!(F.jpvt, n)
@@ -1861,8 +1909,11 @@ function _factorize_qr!(F::SpecializedQR{T}, A::AbstractMatrix{T}) where {T <: B
 end
 
 # Generic element types: generic column-pivoted QR stored in the same fields.
-function _factorize_qr!(F::SpecializedQR{T}, A::AbstractMatrix{T}) where {T}
+# Structure detection is a BlasFloat-only optimization; the generic path keeps
+# its documented rank-truncated basic-solve contract (so `detect` is ignored).
+function _factorize_qr!(F::SpecializedQR{T}, A::AbstractMatrix{T}, detect::Bool) where {T}
     m, n = F.m, F.n
+    F.form = GENERAL
     fac = qr(A, ColumnNorm())
     C = _ensure_qr_factors!(F, m, n)
     copyto!(C, fac.factors)
@@ -1877,6 +1928,95 @@ function _factorize_qr!(F::SpecializedQR{T}, A::AbstractMatrix{T}) where {T}
     F.rank = r
     F.status = r == n ? QR_FULLRANK : QR_DEFICIENT
     return F
+end
+
+# --- structured fast paths (BlasFloat, square) ------------------------------
+
+# DIAGONAL: the diagonal entries ARE the singular values, so the rank-revealing
+# rank and the minimum-norm least-squares solution are both exact and O(n) — no
+# QR, no fallback, singular-safe. rank = count(|dᵢ| ≥ max|d|·rtol) uses the
+# INCLUSIVE ≥ to match the laic1 boundary the geqp3 path uses.
+function _factorize_qr_diagonal!(F::SpecializedQR{T}, A::AbstractMatrix{T}) where {T}
+    n = F.n
+    d = _resize!(F.dvec, n)
+    @inbounds for i in 1:n
+        d[i] = A[i, i]
+    end
+    F.form = DIAGONAL
+    F.info = 0
+    dmax = zero(real(T))
+    @inbounds for i in 1:n
+        a = abs(d[i])
+        a > dmax && (dmax = a)
+    end
+    tol = dmax * F.rtol
+    r = 0
+    if dmax != 0
+        @inbounds for i in 1:n
+            abs(d[i]) >= tol && (r += 1)
+        end
+    end
+    F.rank = r
+    F.status = r == n ? QR_FULLRANK : QR_DEFICIENT
+    return F
+end
+
+# Conservative full-rank / well-conditioning gate for a SQUARE triangular (or
+# bidiagonal, which is triangular) matrix `C`, which IS its own R. Returns true
+# only when `C` is comfortably full rank: the laic1 incremental condition
+# estimate must clear `rtol` with a safety `margin`, so the structured trtrs
+# solve provably reproduces the geqp3/pinv rank and solution. A near-singular,
+# ill-conditioned, or zero-pivot `C` returns false and routes to the dense
+# rank-revealing geqp3 path. 0-alloc (reuses F.wmin/F.wmax; for a lower-
+# triangular C, F.dvec doubles as a contiguous row-slice buffer — safe because
+# the DIAGONAL and triangular paths are mutually exclusive). The margin is
+# empirical (≥16 left zero unsafe cases over 20000 trials); geqp3 is the
+# contract source of truth, so the gate is deliberately conservative.
+const _QR_GATE_MARGIN = 32
+
+function _gate_fullrank(F::SpecializedQR{T}, C::AbstractMatrix{T}, lower::Bool) where {T <: BlasFloat}
+    n = F.n
+    n == 0 && return false
+    _first_zero_diag(C, n) == 0 || return false   # exact zero pivot ⇒ trtrs would throw
+    Re = real(T)
+    smax = Re(abs(C[1, 1]))
+    smin = smax
+    smax == 0 && return false
+    thr = _QR_GATE_MARGIN * F.rtol
+    wmin = _resize!(F.wmin, n)
+    wmax = _resize!(F.wmax, n)
+    g = _resize!(F.dvec, n)        # contiguous slice buffer for the raw laic1 ccall
+    @inbounds for k in 1:n
+        wmin[k] = zero(T)
+        wmax[k] = zero(T)
+    end
+    wmin[1] = one(T)
+    wmax[1] = one(T)
+    @inbounds for rnk in 1:(n - 1)
+        i = rnk + 1
+        # The i-th column of the upper-triangular factor, copied into the
+        # contiguous buffer `g` so the raw laic1 ccall sees unit stride (a
+        # strided row/column view would either be a non-unit-stride ptr or a
+        # type-unstable Union of two SubArray types). For a lower-triangular C we
+        # estimate σ via Cᵀ (same singular values), whose i-th column is row i.
+        for k in 1:rnk
+            g[k] = lower ? C[i, k] : C[k, i]
+        end
+        w = view(g, 1:rnk)
+        gamma = C[i, i]
+        sminpr, s1, c1 = _laic1(T, 2, view(wmin, 1:rnk), smin, w, gamma)
+        smaxpr, s2, c2 = _laic1(T, 1, view(wmax, 1:rnk), smax, w, gamma)
+        smaxpr * thr > sminpr && return false
+        for k in 1:rnk
+            wmin[k] *= s1
+            wmax[k] *= s2
+        end
+        wmin[i] = c1
+        wmax[i] = c2
+        smin = sminpr
+        smax = smaxpr
+    end
+    return true
 end
 
 # --- solving ----------------------------------------------------------------
@@ -1951,7 +2091,78 @@ end
     return rhs
 end
 
+# DIAGONAL structured solve: the minimum-norm least-squares solution xᵢ = bᵢ/dᵢ
+# for kept coordinates (|dᵢ| ≥ tol) and 0 for the dropped (free) ones. This is
+# the QR min-norm contract (NOT the LU `b ./ d`, which gives Inf on a zero dᵢ):
+# zeroing the free coordinates is the min-norm choice because a diagonal matrix
+# has orthogonal columns. 0-alloc, Inf-safe (a sub-tolerance dᵢ is never divided).
+function _qr_solve_diagonal!(x::AbstractVecOrMat, F::SpecializedQR{T}, b::AbstractVecOrMat) where {T <: BlasFloat}
+    n = F.n
+    d = F.dvec
+    dmax = zero(real(T))
+    @inbounds for i in 1:n
+        a = abs(d[i])
+        a > dmax && (dmax = a)
+    end
+    # All-zero diagonal ⇒ rank 0 ⇒ zero solution (and tol would be 0, which would
+    # otherwise make the `>=` keep — and divide by — the zero entries).
+    if dmax == 0
+        fill!(x, zero(T))
+        return x
+    end
+    tol = dmax * F.rtol
+    if b isa AbstractVector
+        @inbounds for i in 1:n
+            x[i] = abs(d[i]) >= tol ? b[i] / d[i] : zero(T)
+        end
+    else
+        @inbounds for c in axes(x, 2), i in 1:n
+            x[i, c] = abs(d[i]) >= tol ? b[i, c] / d[i] : zero(T)
+        end
+    end
+    return x
+end
+
+# Triangular (or bidiagonal) structured solve. The factorization gate certified
+# `A` is comfortably full rank and square, so `A` IS its own R and the unique
+# solution from a single triangular solve equals the least-squares = minimum-norm
+# solution. No column permutation (no pivoting), so no scatter. 0-alloc (trtrs
+# has no work buffer; reuses the exact-size F.rhs buffer).
+function _qr_solve_triangular!(x::AbstractVecOrMat, F::SpecializedQR{T}, b::AbstractVecOrMat, uplo::Char) where {T <: BlasFloat}
+    n = F.n
+    nrhs = size(b, 2)
+    rhs = _ensure_qr_rhs!(F, max(F.m, n), nrhs)
+    if b isa AbstractVector
+        @inbounds for i in 1:n
+            rhs[i, 1] = b[i]
+        end
+    else
+        @inbounds for c in 1:nrhs, i in 1:n
+            rhs[i, c] = b[i, c]
+        end
+    end
+    _trtrs_into!(F, uplo, F.factors, rhs, n)
+    if x isa AbstractVector
+        @inbounds for i in 1:n
+            x[i] = rhs[i, 1]
+        end
+    else
+        @inbounds for c in 1:nrhs, i in 1:n
+            x[i, c] = rhs[i, c]
+        end
+    end
+    return x
+end
+
 function _qr_solve!(x::AbstractVecOrMat, F::SpecializedQR{T}, b::AbstractVecOrMat) where {T <: BlasFloat}
+    if F.form == DIAGONAL
+        return _qr_solve_diagonal!(x, F, b)
+    elseif F.form == LOWER_TRIANGULAR || F.form == LOWER_BIDIAGONAL
+        return _qr_solve_triangular!(x, F, b, 'L')
+    elseif F.form == UPPER_TRIANGULAR || F.form == UPPER_BIDIAGONAL
+        return _qr_solve_triangular!(x, F, b, 'U')
+    end
+    # dense rank-revealing geqp3 path (F.form == GENERAL)
     m, n, r = F.m, F.n, F.rank
     fill!(x, zero(T))
     r == 0 && return x
@@ -2070,6 +2281,21 @@ end
                 specializingqr(A; minnorm = false)
             end
             specializingqr(Asq; fallback = false)
+
+            # QR structured fast paths: diagonal (incl. a zero ⇒ rank-deficient),
+            # well-conditioned triangular (gate pass), and the geqp3 fallback.
+            Aqdiag = [i == j ? cv(i + 2, 0) : zT for i in 1:n, j in 1:n]
+            Aqdiag[2, 2] = zT
+            Aqutri = [i <= j ? (i == j ? cv(n + i, 0) : cv(0.1, 0)) : zT for i in 1:n, j in 1:n]
+            Aqltri = [i >= j ? (i == j ? cv(n + i, 0) : cv(0.1, 0)) : zT for i in 1:n, j in 1:n]
+            for A in (Aqdiag, Aqutri, Aqltri)
+                bq = ones(T, n)
+                xq = ones(T, n)
+                Q = specializingqr(A)
+                Q \ bq
+                ldiv!(xq, Q, bq)
+                structuralform(Q)
+            end
         end
     end
 end

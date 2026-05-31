@@ -261,6 +261,40 @@ variables zeroed) on the `BlasFloat` path; `fallback = false` leaves the
 workspace unfactored for a host that wants to own the QR (mirroring the LU
 `fallback_lu`).
 
+### Structure specialization
+
+For a **square** `BlasFloat` input, `SpecializedQR` reuses the same
+[`detect_form`](#detected-forms-and-the-specialized-solve-used) scan as the LU
+solver and takes a cheaper structured path when doing so *provably* reproduces
+the dense rank-revealing result — never weakening the rank-revealing / min-norm /
+never-throw contract:
+
+- **`DIAGONAL`** → an O(n) rank-revealing reciprocal solve. The diagonal entries
+  *are* the singular values, so `rank = count(|dᵢ| ≥ max|d|·rtol)` and
+  `xᵢ = bᵢ/dᵢ` (or 0 for dropped coordinates) is *exactly* the min-norm
+  least-squares solution `pinv(A)*b` gives — including for singular diagonals,
+  with no fallback (O(n) instead of O(n³)).
+- **`LOWER_/UPPER_TRIANGULAR`, `LOWER_/UPPER_BIDIAGONAL`** (a triangular matrix
+  *is* its own R) → a direct triangular solve, **but only behind a conservative
+  condition gate** (an incremental `laic1` estimate, with a safety margin). A
+  triangular matrix's diagonal is *not* its singular spectrum, so a near-singular
+  or ill-conditioned instance — where the dense rank-revealing `geqp3` would
+  truncate the rank — fails the gate and falls back to `geqp3` (which also
+  prevents the `LAPACKException` a zero-pivot triangular solve would throw). When
+  the gate passes, the matrix is comfortably full rank and the structured solve
+  is numerically identical to `geqp3`.
+- **`GENERAL`, the symmetric forms, `TRIDIAGONAL`/`BANDED`, rectangular, and
+  near-singular structured inputs** → the dense rank-revealing `geqp3` path
+  (symmetry gives no rank-revealing advantage; `detect_form` is square-only, so
+  rectangular least-squares always uses `geqp3`).
+
+`rank(F)`, `issuccess(F)`, and the solution are indistinguishable from the
+`geqp3` path regardless of which path was taken; the structural form actually
+used is queryable via `structuralform(F)`, and `detect_structure = false`
+disables the fast paths entirely (the pre-structure behavior). The structured
+solve and warm re-factor are **0-allocation** on Julia 1.10 and 1.12, the same as
+the dense path.
+
 ### Element types
 
 - **`BlasFloat`** (`Float32`/`Float64`/`ComplexF32`/`ComplexF64`): the

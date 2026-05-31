@@ -730,4 +730,151 @@ _reltol(::Type{T}) where {T} = (real(T) === Float32 ? 1.0f-3 : 1.0e-8)
         @test_throws DimensionMismatch ldiv!(zeros(3), F, ones(6))   # wrong x rows
         @test_throws DimensionMismatch ldiv!(F, ones(6))             # 2-arg needs square
     end
+
+    # ----- structure specialization (detect_form reused by the QR solver) -----
+
+    # A well-conditioned, diagonally-dominant instance of each structured form.
+    function _struct_mat(form::MatrixForm, ::Type{T}, n::Int) where {T}
+        dom() = T <: Complex ? T(n + 3, 0) : T(n + 3)
+        off() = T <: Complex ? T(0.1, 0.1) : T(0.1)
+        if form == DIAGONAL
+            return Matrix(Diagonal(T[dom() for _ in 1:n]))
+        elseif form == UPPER_TRIANGULAR
+            return T[i < j ? off() : (i == j ? dom() : zero(T)) for i in 1:n, j in 1:n]
+        elseif form == LOWER_TRIANGULAR
+            return T[i > j ? off() : (i == j ? dom() : zero(T)) for i in 1:n, j in 1:n]
+        elseif form == UPPER_BIDIAGONAL
+            return Matrix(Bidiagonal(T[dom() for _ in 1:n], T[off() for _ in 1:(n - 1)], :U))
+        else # LOWER_BIDIAGONAL
+            return Matrix(Bidiagonal(T[dom() for _ in 1:n], T[off() for _ in 1:(n - 1)], :L))
+        end
+    end
+
+    @testset "structured forms match pinv & geqp3: $T, $form" for
+        T in (Float64, Float32, ComplexF64, ComplexF32),
+            form in (
+                DIAGONAL, UPPER_TRIANGULAR, LOWER_TRIANGULAR,
+                UPPER_BIDIAGONAL, LOWER_BIDIAGONAL,
+            )
+
+        n = 9
+        A = _struct_mat(form, T, n)
+        b = _qrand(T, n)
+        F = specializingqr(A)
+        x = F \ b
+        @test structuralform(F) == form          # took the structured fast path
+        @test rank(F) == n
+        @test matrixform(F) == QR_FULLRANK
+        @test issuccess(F)
+        @test x ≈ pinv(A) * b rtol = _reltol(T)
+        @test x ≈ qr(A, ColumnNorm()) \ b rtol = _reltol(T)
+        # indistinguishable from the dense rank-revealing path:
+        Fg = specializingqr(A; detect_structure = false)
+        @test structuralform(Fg) == GENERAL
+        @test rank(F) == rank(Fg)
+        @test x ≈ Fg \ b rtol = _reltol(T)
+        # multi-RHS
+        B = _qrand(T, n, 3)
+        @test F \ B ≈ pinv(A) * B rtol = _reltol(T)
+    end
+
+    @testset "DIAGONAL rank-revealing + singular (pure structured): $T" for
+        T in (Float64, Float32, ComplexF64, ComplexF32)
+
+        # exact zeros and a sub-tolerance entry ⇒ rank deficiency, no fallback
+        d = T[2, 0, 3, 0, 4]
+        d[5] = T(maximum(abs, d)) * (5 * eps(real(T)) / 4)  # sub-tolerance ⇒ dropped
+        A = Matrix(Diagonal(d))
+        b = _qrand(T, 5)
+        F = specializingqr(A)
+        x = F \ b
+        @test structuralform(F) == DIAGONAL          # still structured (no fallback)
+        @test rank(F) == 2
+        @test issuccess(F)                           # deficiency is success
+        @test all(isfinite, x)
+        @test x ≈ pinv(A) * b rtol = _reltol(T)
+        @test x ≈ qr(A, ColumnNorm()) \ b rtol = _reltol(T)
+        # all-zero diagonal ⇒ rank 0, zero solution, no throw
+        let Z = zeros(T, 4, 4), F0 = specializingqr(Z)
+            @test rank(F0) == 0
+            @test structuralform(F0) == DIAGONAL
+            @test iszero(F0 \ _qrand(T, 4))
+        end
+        # the rank matches geqp3 across a randomized stress of zeros/tiny entries
+        for _ in 1:50
+            dd = _qrand(T, 8)
+            for k in 1:8
+                rand() < 0.3 && (dd[k] = zero(T))
+            end
+            AA = Matrix(Diagonal(dd))
+            @test rank(specializingqr(AA)) == rank(specializingqr(AA; detect_structure = false))
+        end
+    end
+
+    @testset "ill-conditioned / singular structured fall back to geqp3 (contract)" begin
+        # graded ill-conditioned upper-triangular: gate fails ⇒ geqp3, and the
+        # rank + solution stay identical to the dense rank-revealing reference.
+        n = 12
+        A = triu(ones(n, n))
+        for i in 1:n
+            A[i, i] = 10.0^(-1.4 * (i - 1))            # cond ≈ 1e15, past the rtol boundary
+        end
+        b = randn(n)
+        F = specializingqr(A)
+        Fg = specializingqr(A; detect_structure = false)
+        @test structuralform(F) == GENERAL            # gate failed ⇒ fell back
+        @test rank(F) == rank(Fg)                     # same revealed rank as geqp3
+        @test F \ b ≈ Fg \ b rtol = 1.0e-8            # same solution as geqp3
+        @test F \ b ≈ pinv(A) * b rtol = 1.0e-7
+        @test all(isfinite, F \ b)
+
+        # exact zero on a triangular diagonal: a plain trtrs would THROW; we must
+        # fall back to geqp3 and return the finite min-norm solution.
+        let U = [2.0 1.0 3.0; 0.0 0.0 4.0; 0.0 0.0 5.0], bz = [1.0, 2.0, 3.0]
+            Fz = specializingqr(U)
+            @test structuralform(Fz) == GENERAL
+            @test all(isfinite, Fz \ bz)
+            @test Fz \ bz ≈ pinv(U) * bz rtol = 1.0e-9
+            @test rank(Fz) == 2
+        end
+    end
+
+    @testset "structured paths: 0 allocations (warm solve + refactor): $T" for
+        T in (Float64, Float32, ComplexF64, ComplexF32)
+
+        @noinline solv(x, F, b) = (ldiv!(x, F, b); @allocated ldiv!(x, F, b))
+        @noinline refac(F, A) = (specializingqr!(F, A); @allocated specializingqr!(F, A))
+        n = 10
+        for form in (DIAGONAL, UPPER_TRIANGULAR, LOWER_TRIANGULAR, UPPER_BIDIAGONAL, LOWER_BIDIAGONAL)
+            A = _struct_mat(form, T, n)
+            b = _qrand(T, n)
+            F = SpecializedQR{T}(n, n)
+            specializingqr!(F, A)
+            x = Vector{T}(undef, n)
+            @test structuralform(F) == form
+            @test solv(x, F, b) == 0
+            @test refac(F, A) == 0
+        end
+    end
+
+    @testset "structured paths: type stability and escape hatches" begin
+        for T in (Float64, ComplexF64)
+            for form in (DIAGONAL, UPPER_TRIANGULAR, LOWER_TRIANGULAR)
+                A = _struct_mat(form, T, 6)
+                @test (@inferred specializingqr(A)) isa SpecializedQR{T, real(T)}
+                F = specializingqr(A)
+                x = Vector{T}(undef, 6); b = _qrand(T, 6)
+                @test (@inferred ldiv!(x, F, b)) === x
+            end
+        end
+        # detect_structure = false forces the dense path even for a diagonal A,
+        # and returns the identical solution.
+        let A = Matrix(Diagonal(randn(6) .+ 3.0)), b = randn(6)
+            @test structuralform(specializingqr(A; detect_structure = false)) == GENERAL
+            @test specializingqr(A) \ b ≈ specializingqr(A; detect_structure = false) \ b
+        end
+        # rectangular input must NOT call detect_form (it is square-only / throws)
+        @test structuralform(specializingqr(randn(7, 4))) == GENERAL
+        @test structuralform(specializingqr(randn(4, 7))) == GENERAL
+    end
 end
