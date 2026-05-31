@@ -10,7 +10,7 @@ export MatrixForm,
     GENERAL, DIAGONAL, LOWER_TRIANGULAR, UPPER_TRIANGULAR,
     LOWER_BIDIAGONAL, UPPER_BIDIAGONAL, TRIDIAGONAL, BANDED,
     SYMMETRIC_POSITIVE_DEFINITE, SYMMETRIC_INDEFINITE, HERMITIAN_INDEFINITE
-export SpecializedLU, specializinglu, specializinglu!, detect_form, DetectionResult,
+export SpecializedLU, specializinglu, specializinglu!, reserve!, detect_form, DetectionResult,
     matrixform, issuccess, isfactored
 
 # ---------------------------------------------------------------------------
@@ -257,23 +257,74 @@ function SpecializedLU{T}() where {T}
 end
 
 """
-    SpecializedLU{T}(n::Integer)
+    SpecializedLU{T}(n::Integer; kl = 0, ku = 0, symmetric = false)
 
-Construct a workspace with buffers pre-sized for an `n×n` matrix of element
-type `T`. Useful for hosts (e.g. `LinearSolve.jl`) that want an
-allocation-free reuse path for the common dense/LU/symmetric case; the band
-buffer is still grown lazily when a narrow-banded matrix is first seen.
+Construct a workspace with buffers pre-sized (via [`reserve!`](@ref)) for an
+`n×n` matrix of element type `T`, so that subsequent factorizations and solves
+at size ≤ `n` are allocation-free. The dense and `O(n)` buffers are always
+reserved; pass `kl`/`ku` to also reserve the banded `AB` buffer, and
+`symmetric = true` to reserve the Bunch–Kaufman LAPACK work buffer — giving a
+fully upfront-allocated workspace for those forms too.
 """
-function SpecializedLU{T}(n::Integer) where {T}
-    R = real(T)
+function SpecializedLU{T}(n::Integer; kl::Integer = 0, ku::Integer = 0, symmetric::Bool = false) where {T}
+    F = SpecializedLU{T}()
+    return reserve!(F, Int(n); kl = Int(kl), ku = Int(ku), symmetric = symmetric)
+end
+
+"""
+    reserve!(F::SpecializedLU, n; kl = 0, ku = 0, symmetric = false) -> F
+
+Grow `F`'s buffers so a problem of size up to `n` (bandwidth `kl,ku`; and the
+Bunch–Kaufman work buffer when `symmetric`) factors and solves with **zero**
+allocations. Buffers only ever grow, so `reserve!`-ing the largest problem you
+will solve makes every later `specializinglu!` + `ldiv!` at that size or
+smaller allocation-free. Use this for hot loops / real-time use where all
+allocation must happen upfront.
+"""
+function reserve!(F::SpecializedLU{T}, n::Integer; kl::Integer = 0, ku::Integer = 0, symmetric::Bool = false) where {T}
     nn = Int(n)
-    return SpecializedLU{T, R}(
-        GENERAL, 0, 0, 0, 'U', false, false, 0, false,
-        Matrix{T}(undef, nn, nn), Vector{Int}(undef, nn),
-        Vector{T}(undef, nn), Vector{T}(undef, max(nn - 1, 0)),
-        Vector{T}(undef, max(nn - 1, 0)), Vector{T}(undef, max(nn - 2, 0)),
-        Matrix{T}(undef, 0, 0), T[]
+    _ensure_fact!(F, nn)                       # dense fact (LU / Cholesky / Bunch-Kaufman / triangular)
+    _resize!(F.ipiv, nn)
+    _resize!(F.dvec, nn)
+    _resize!(F.dl, max(nn - 1, 0))
+    _resize!(F.du, max(nn - 1, 0))
+    _resize!(F.du2, max(nn - 2, 0))
+    if kl > 0 || ku > 0
+        _ensure_band!(F, 2 * Int(kl) + Int(ku) + 1, nn)
+    end
+    if symmetric
+        _reserve_work!(F, nn)                  # Bunch-Kaufman work buffer (BlasFloat only)
+    end
+    return F
+end
+
+# Size F.work to the optimal Bunch-Kaufman workspace for an n×n problem via the
+# LAPACK lwork query (no-op for non-BlasFloat element types, which use generic
+# LU and need no work buffer).
+_reserve_work!(F::SpecializedLU, ::Int) = F
+for (fname, elty) in (
+        (:dsytrf_, :Float64), (:ssytrf_, :Float32),
+        (:csytrf_, :ComplexF32), (:zsytrf_, :ComplexF64),
     )
+    @eval function _reserve_work!(F::SpecializedLU{$elty}, n::Int)
+        n == 0 && return F
+        C = _ensure_fact!(F, n)
+        ipiv = _resize!(F.ipiv, n)
+        wq = Ref{$elty}()
+        info = Ref{BlasInt}()
+        lda = max(1, stride(C, 2))
+        ccall(
+            (@blasfunc($fname), libblastrampoline), Cvoid,
+            (
+                Ref{UInt8}, Ref{BlasInt}, Ptr{$elty}, Ref{BlasInt},
+                Ptr{BlasInt}, Ptr{$elty}, Ref{BlasInt}, Ref{BlasInt}, Clong,
+            ),
+            'U', n, C, lda, ipiv, wq, BlasInt(-1), info, 1
+        )
+        lwork = max(1, Int(real(wq[])))
+        length(F.work) < lwork && _resize!(F.work, lwork)
+        return F
+    end
 end
 
 matrixform(F::SpecializedLU) = F.form
@@ -323,6 +374,13 @@ end
     return 0
 end
 
+# The dense `fact` buffer is kept EXACTLY n×n: the dense solves pass it straight
+# to LAPACK (potrs!/sytrs!/hetrs!/getrs!/trsv), and on the Julia 1.10 LTS those
+# wrappers allocate a small temporary when handed a strided `view` (the SubArray
+# is not elided there), which would break the zero-allocation solve. A real
+# n×n `Matrix` keeps the solve 0-alloc on every supported Julia version; the
+# trade is that a change in the *dense* problem size reallocates this O(n²)
+# buffer (negligible next to the factorization, and fixed-size reuse is 0-alloc).
 function _ensure_fact!(F::SpecializedLU{T}, n::Int) where {T}
     if size(F.fact, 1) != n || size(F.fact, 2) != n
         F.fact = Matrix{T}(undef, n, n)
@@ -330,12 +388,20 @@ function _ensure_fact!(F::SpecializedLU{T}, n::Int) where {T}
     return F.fact
 end
 
+# The `band` buffer IS grow-only: its solve (`_solve_banded!`) is pure Julia, so
+# a strided sub-view is allocation-free on every Julia version. It reallocates
+# only when capacity is insufficient; shrinking the size/bandwidth reuses it.
 function _ensure_band!(F::SpecializedLU{T}, rows::Int, n::Int) where {T}
-    if size(F.band, 1) != rows || size(F.band, 2) != n
-        F.band = Matrix{T}(undef, rows, n)
+    if size(F.band, 1) < rows || size(F.band, 2) < n
+        F.band = Matrix{T}(undef, max(rows, size(F.band, 1)), max(n, size(F.band, 2)))
     end
-    return F.band
+    return @view F.band[1:rows, 1:n]
 end
+
+# Logical factor / band sub-matrix for the current problem. `fact` is exact-size
+# so this is the buffer itself; `band` may be a larger capacity buffer.
+@inline _factmat(F::SpecializedLU) = F.fact
+@inline _bandmat(F::SpecializedLU) = @view F.band[1:(2 * F.kl + F.ku + 1), 1:F.n]
 
 # ---------------------------------------------------------------------------
 # Public construction / factorization
@@ -863,7 +929,7 @@ end
 
 function _solve_triangular!(x, F::SpecializedLU, b, ::Type{W}) where {W}
     x === b || copyto!(x, b)
-    ldiv!(W(F.fact), x)
+    ldiv!(W(_factmat(F)), x)
     return x
 end
 
@@ -1016,7 +1082,7 @@ end
 # loop. Allocation-free.
 function _solve_banded!(x, F::SpecializedLU{T}, b) where {T}
     x === b || copyto!(x, b)
-    AB = F.band
+    AB = _bandmat(F)
     ipiv = F.ipiv
     kl = F.kl
     ku = F.ku
@@ -1049,28 +1115,28 @@ end
 # symmetric positive definite (Cholesky)
 function _solve_posdef!(x, F::SpecializedLU{T}, b) where {T <: BlasFloat}
     x === b || copyto!(x, b)
-    potrs!(F.uplo, F.fact, x)
+    potrs!(F.uplo, _factmat(F), x)
     return x
 end
 
 # symmetric indefinite (Bunch-Kaufman, sytrf)
 function _solve_symmetric!(x, F::SpecializedLU{T}, b) where {T <: BlasFloat}
     x === b || copyto!(x, b)
-    sytrs!(F.uplo, F.fact, F.ipiv, x)
+    sytrs!(F.uplo, _factmat(F), F.ipiv, x)
     return x
 end
 
 # Hermitian indefinite (hetrf)
 function _solve_hermitian!(x, F::SpecializedLU{T}, b) where {T <: BlasFloat}
     x === b || copyto!(x, b)
-    hetrs!(F.uplo, F.fact, F.ipiv, x)
+    hetrs!(F.uplo, _factmat(F), F.ipiv, x)
     return x
 end
 
 # dense LU fallback (BlasFloat or generic): reconstruct the LU view and solve
 function _solve_dense_lu!(x, F::SpecializedLU{T}, b) where {T}
     x === b || copyto!(x, b)
-    lu = LU(F.fact, F.ipiv, F.info)
+    lu = LU(_factmat(F), F.ipiv, F.info)
     ldiv!(lu, x)
     return x
 end
@@ -1134,11 +1200,11 @@ function LinearAlgebra.det(F::SpecializedLU{T}) where {T}
     elseif form == SYMMETRIC_INDEFINITE
         # det(::BunchKaufman) infers as Union{real(T),T}; coerce to T so the
         # whole `det` stays type-stable for complex element types.
-        return T(det(BunchKaufman(F.fact, F.ipiv, F.uplo, true, false, F.info)))
+        return T(det(BunchKaufman(_factmat(F), F.ipiv, F.uplo, true, false, F.info)))
     elseif form == HERMITIAN_INDEFINITE
-        return T(det(BunchKaufman(F.fact, F.ipiv, F.uplo, false, false, F.info)))
+        return T(det(BunchKaufman(_factmat(F), F.ipiv, F.uplo, false, false, F.info)))
     else
-        return det(LU(F.fact, F.ipiv, F.info))
+        return det(LU(_factmat(F), F.ipiv, F.info))
     end
 end
 

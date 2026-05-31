@@ -86,6 +86,32 @@ issuccess(F)                 # false if singular (uniform across all forms)
 specializinglu!(F, A2)       # re-detect + re-factor into F, growing buffers as needed
 ```
 
+### Allocation-free / real-time use
+
+After the initial setup, the warm hot path is **zero-allocation** for every form
+(both `specializinglu!` re-factor and `ldiv!` solve), on Julia 1.10 and 1.12. To
+push *all* buffer allocation upfront — so nothing grows later — `reserve!` (or the
+keyword constructor) pre-sizes every buffer, including the banded `AB` and the
+Bunch–Kaufman work buffer:
+
+```julia
+F = SpecializedLU{Float64}(n; kl = 2, ku = 2, symmetric = true)  # presize everything
+# ...or grow an existing workspace's buffers to a high-water mark:
+reserve!(F, n; kl = 2, ku = 2, symmetric = true)
+
+# now, in a hot loop, every re-factor + solve at size ≤ n allocates nothing:
+for k in 1:nsteps
+    specializinglu!(F, A_k)   # 0 allocations
+    ldiv!(x, F, b_k)          # 0 allocations
+end
+```
+
+Buffers are grow-only: the band and `O(n)` buffers never reallocate when the
+problem shrinks or its bandwidth changes within capacity. (The dense `n×n`
+factor buffer is kept exact-size — a real `Matrix` rather than a strided view —
+so dense solves stay 0-allocation on the 1.10 LTS; it only reallocates if you
+change the *dense* problem size, which is negligible next to the factorization.)
+
 ### Just the detector
 
 ```julia
