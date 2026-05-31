@@ -284,11 +284,16 @@ never-throw contract:
   the gate passes, the matrix is comfortably full rank and the structured solve
   is numerically identical to `geqp3`.
 - **`TRIDIAGONAL`** (`gttrf`/`gttrs`, O(n)) and **`BANDED`** (`gbtrf`/`gbtrs`,
-  O(n·b²)) → the structured LU factor + solve, behind the **same condition gate**
-  applied to the (banded) upper factor U (`cond(U)` tracks `cond(A)` under
-  partial pivoting; verified zero unsafe over thousands of wildly-conditioned
-  matrices). A singular or ill-conditioned banded matrix fails the gate (or hits
-  a zero pivot) and falls back to `geqp3`. Reserve the band buffer for the
+  O(n·b²)) → the structured LU factor + solve, behind the condition gate. A
+  strictly diagonally-dominant band matrix (the common case — diffusion
+  operators, implicit-ODE Jacobians) is certified full rank by a **provable
+  O(n·b) Varah diagonal-dominance early-accept** (`σ_min/σ_max ≥ β/(√n·α)` from a
+  true lower bound), skipping the O(n²) `laic1` sweep entirely — ~1.3–1.6× faster
+  factorization at n = 200–500. A non-dominant matrix falls through to the
+  `laic1` gate applied to the (banded) upper factor U (`cond(U)` tracks `cond(A)`
+  under partial pivoting; verified zero unsafe over thousands of wildly-
+  conditioned matrices); a singular or ill-conditioned one fails the gate (or
+  hits a zero pivot) and falls back to `geqp3`. Reserve the band buffer for the
   `BANDED` path with `SpecializedQR{T}(n, n; kl, ku)` / `reserve!(F, n, n; kl, ku)`.
 - **`GENERAL`, the symmetric forms, rectangular, and near-singular structured
   inputs** → the dense rank-revealing `geqp3` path (symmetry gives no

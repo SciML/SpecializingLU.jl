@@ -913,4 +913,47 @@ _reltol(::Type{T}) where {T} = (real(T) === Float32 ? 1.0f-3 : 1.0e-8)
         @test structuralform(specializingqr(randn(7, 4))) == GENERAL
         @test structuralform(specializingqr(randn(4, 7))) == GENERAL
     end
+
+    @testset "band gate: Varah early-accept and laic1 fallback agree with geqp3: $T" for
+        T in (Float64, Float32, ComplexF64, ComplexF32)
+
+        rt = _reltol(T)
+        n = 16
+        # strongly diagonally dominant ⇒ the O(n)/O(n·b) Varah early-accept fires
+        # (no laic1 sweep); NOT diagonally dominant but still full rank ⇒ Varah
+        # declines and the O(n²) laic1 gate accepts. Both must equal geqp3/pinv.
+        for (kl, ku) in ((1, 1), (2, 2))
+            dl = T[_qrand(T, 1)[1] for _ in 1:(n - 1)]
+            dom = Matrix(Tridiagonal(dl .* T(0.2), T[_qrand(T, 1)[1] + T(8) for _ in 1:n], dl .* T(0.2)))
+            if kl == 2
+                dom = dom + diagm(2 => fill(T(0.1), n - 2), -2 => fill(T(0.1), n - 2))
+            end
+            # off-diagonals larger than the diagonal ⇒ not diagonally dominant
+            nondom = Matrix(
+                Tridiagonal(
+                    T[_qrand(T, 1)[1] + T(3) for _ in 1:(n - 1)],
+                    T[_qrand(T, 1)[1] * T(0.5) for _ in 1:n],
+                    T[_qrand(T, 1)[1] + T(3) for _ in 1:(n - 1)],
+                )
+            )
+            for A in (dom, nondom)
+                b = _qrand(T, n)
+                F = specializingqr(A)
+                Fg = specializingqr(A; detect_structure = false)
+                @test structuralform(F) in (TRIDIAGONAL, BANDED)
+                @test rank(F) == rank(Fg)                 # Varah/laic1 path == geqp3 rank
+                @test F \ b ≈ pinv(A) * b rtol = rt
+                @test F \ b ≈ Fg \ b rtol = rt
+            end
+        end
+        # a barely-non-dominant-but-rank-deficient tridiagonal must still fall to
+        # geqp3 (Varah declines; laic1/gttrf detect the deficiency): never a
+        # spurious full-rank Varah accept.
+        let A = Matrix(Tridiagonal([1.0, 1.0], [0.0, 0.0, 0.0], [1.0, 1.0])), bz = [1.0, 2.0, 3.0]
+            F = specializingqr(A)
+            @test structuralform(F) == GENERAL
+            @test rank(F) == 2
+            @test F \ bz ≈ pinv(A) * bz rtol = 1.0e-9
+        end
+    end
 end

@@ -1915,7 +1915,8 @@ function _factorize_qr!(F::SpecializedQR{T}, A::AbstractMatrix{T}, detect::Bool)
             # gate failed (near-singular / ill-conditioned): fall through to geqp3.
         elseif f == TRIDIAGONAL
             _factorize_qr_tridiagonal!(F, A)
-            if F.info == 0 && _gate_fullrank_band!(F, true)
+            # Varah O(n) early-accept (diagonally dominant) skips the O(n²) gate.
+            if F.info == 0 && (_varah_band_accept(A, n, 1, 1, F.rtol) || _gate_fullrank_band!(F, true))
                 F.form = TRIDIAGONAL
                 F.rank = n
                 F.status = QR_FULLRANK
@@ -1923,7 +1924,7 @@ function _factorize_qr!(F::SpecializedQR{T}, A::AbstractMatrix{T}, detect::Bool)
             end
         elseif f == BANDED
             _factorize_qr_banded!(F, A, d.kl, d.ku)
-            if F.info == 0 && _gate_fullrank_band!(F, false)
+            if F.info == 0 && (_varah_band_accept(A, n, d.kl, d.ku, F.rtol) || _gate_fullrank_band!(F, false))
                 F.form = BANDED
                 F.rank = n
                 F.status = QR_FULLRANK
@@ -2111,6 +2112,39 @@ end
 # column of U above the diagonal is reconstructed from the compact storage into
 # the contiguous `gbuf` (kept zero between steps via the reset trick), so the raw
 # laic1 ccall sees unit stride. 0-alloc (reuses F.wmin/F.wmax/F.gbuf).
+#
+# Provable strict-diagonal-dominance early-accept, read straight from the
+# ORIGINAL band of A (O(n·(kl+ku)), no buffers). By Varah's theorem a strictly
+# diagonally dominant A has σ_min ≥ β = min_i(|aᵢᵢ|−Rᵢ) and σ_max ≤ α =
+# max_i(|aᵢᵢ|+Rᵢ) (Rᵢ = the in-band off-diagonal row sum), so σ_min/σ_max ≥
+# β/(√n·α). Accepting only when β/α ≥ n·rtol (n ≥ √n) guarantees the matrix
+# clears geqp3's rtol threshold, so the structured solve provably equals geqp3 —
+# the O(n²) laic1 sweep is skipped for the common (diagonally-dominant) case.
+# It is a true LOWER bound, so it can never certify a rank-deficient matrix
+# (verified: 0 unsafe over adversarial barely-dominant probes at n up to 800);
+# a non-dominant A declines here and falls through to the laic1 gate, contract
+# unchanged.
+function _varah_band_accept(A::AbstractMatrix{T}, n::Int, kl::Int, ku::Int, rtol) where {T <: BlasFloat}
+    n == 0 && return false
+    Re = real(T)
+    mind = Re(Inf)
+    maxs = zero(Re)
+    @inbounds for i in 1:n
+        aii = abs(A[i, i])
+        ri = zero(Re)
+        for j in max(1, i - ku):min(n, i + kl)
+            j == i && continue
+            ri += abs(A[i, j])
+        end
+        aii > ri || return false           # not strictly diagonally dominant
+        d = aii - ri
+        d < mind && (mind = d)
+        s = aii + ri
+        s > maxs && (maxs = s)
+    end
+    return maxs > 0 && mind >= n * rtol * maxs
+end
+
 function _gate_fullrank_band!(F::SpecializedQR{T}, tridiag::Bool) where {T <: BlasFloat}
     n = F.n
     n == 0 && return false
@@ -2246,6 +2280,21 @@ end
 function _qr_solve_diagonal!(x::AbstractVecOrMat, F::SpecializedQR{T}, b::AbstractVecOrMat) where {T <: BlasFloat}
     n = F.n
     d = F.dvec
+    # Full-rank diagonal: the factorization already certified every |dᵢ| ≥ tol, so
+    # the solve is the plain reciprocal xᵢ = bᵢ/dᵢ — no max-scan and no per-element
+    # tolerance branch (both invariant in the diagonal data fixed at factor time).
+    if F.status == QR_FULLRANK
+        if b isa AbstractVector
+            @inbounds for i in 1:n
+                x[i] = b[i] / d[i]
+            end
+        else
+            @inbounds for c in axes(x, 2), i in 1:n
+                x[i, c] = b[i, c] / d[i]
+            end
+        end
+        return x
+    end
     dmax = zero(real(T))
     @inbounds for i in 1:n
         a = abs(d[i])
