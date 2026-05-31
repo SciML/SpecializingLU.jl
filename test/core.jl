@@ -257,6 +257,59 @@ reltol(::Type{T}) where {T} = 1.0e-8
         end
     end
 
+    @testset "reserve! / grow-only buffers (upfront allocation)" begin
+        # Warm-then-measure (steady state): the first call on any workspace pays
+        # Julia's usual first-execution cost, which is not a buffer allocation —
+        # what `reserve!` guarantees is that no buffer GROWS thereafter.
+        @noinline refac(F, A) = (specializinglu!(F, A); @allocated specializinglu!(F, A))
+        @noinline solv(x, F, b) = (ldiv!(x, F, b); @allocated ldiv!(x, F, b))
+        bandmat(n) = diagm(
+            0 => fill(8.0, n), 1 => fill(0.5, n - 1), -1 => fill(0.5, n - 1),
+            2 => fill(0.25, n - 2), -2 => fill(0.25, n - 2),
+        )
+        allforms(n) = (
+            diagm(0 => randn(n) .+ 3.0),
+            diagm(0 => randn(n) .+ 4.0, 1 => randn(n - 1), -1 => randn(n - 1)),  # tridiagonal
+            bandmat(n),                                                          # banded
+            (M = randn(n, n); Matrix(M * M' + n * I)),                           # SPD
+            (M = randn(n, n); Matrix(M + M')),                                   # symmetric-indefinite
+            randn(n, n) + n * I,                                                 # general
+        )
+        structured(n) = (
+            diagm(0 => randn(n) .+ 3.0),
+            diagm(0 => randn(n) .+ 4.0, 1 => randn(n - 1), -1 => randn(n - 1)),
+            bandmat(n),
+        )
+
+        # reserve! everything; then every form re-factors + solves at 0 allocations.
+        R = SpecializedLU{Float64}()
+        reserve!(R, 256; kl = 2, ku = 2, symmetric = true)
+        b = randn(256); x = similar(b)
+        for A in allforms(256)
+            @test refac(R, A) == 0
+            @test solv(x, R, b) == 0
+            @test norm(A * (R \ b) - b) / norm(b) < 1.0e-7
+        end
+
+        # The band + O(n) buffers are grow-only: SMALLER structured problems
+        # through the same reserved workspace stay 0-alloc and correct (no realloc).
+        bs = randn(64); xs = similar(bs)
+        for A in structured(64)
+            @test refac(R, A) == 0
+            @test solv(xs, R, bs) == 0
+            @test norm(A * (R \ bs) - bs) / norm(bs) < 1.0e-8
+        end
+
+        # The keyword constructor pre-sizes the band + Bunch-Kaufman work buffers
+        # so banded / symmetric workspaces are upfront-allocated too.
+        C = SpecializedLU{Float64}(128; kl = 2, ku = 2, symmetric = true)
+        bc = randn(128); xc = similar(bc)
+        for A in (bandmat(128), (M = randn(128, 128); Matrix(M + M')))
+            @test refac(C, A) == 0
+            @test solv(xc, C, bc) == 0
+        end
+    end
+
     @testset "workspace reuse (specializinglu!)" begin
         n = 16
         F = specializinglu(make(DIAGONAL, Float64, n))
