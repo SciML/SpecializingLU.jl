@@ -1,4 +1,4 @@
-using SpecializingLU
+using SpecializingFactorizations
 using LinearAlgebra
 using BenchmarkTools
 

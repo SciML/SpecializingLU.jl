@@ -1,4 +1,4 @@
-module SpecializingLU
+module SpecializingFactorizations
 
 using LinearAlgebra
 using LinearAlgebra: BlasFloat, BlasInt
